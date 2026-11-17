@@ -172,6 +172,31 @@ func (g *Group) Detect(ctx context.Context) {
 		g.log.Info("detected active model", "active", Key{name, v}.String())
 		return
 	}
+	// None ready: adopt one that is still starting (its unit is up and it
+	// knows its variant), not ready yet. A first request for that variant
+	// then waits for the load instead of restarting the backend, which is
+	// what happens when the router and its backend restart together.
+	for _, name := range g.names {
+		b := g.backends[name]
+		r, ok := b.(Runner)
+		if !ok {
+			continue
+		}
+		if running, known := r.Running(ctx); !known || !running {
+			continue
+		}
+		v, err := b.Current()
+		if err != nil || v == "" {
+			continue
+		}
+		g.mu.Lock()
+		if !g.switching && g.active.Backend == "" {
+			g.active, g.ready = Key{name, v}, false
+		}
+		g.mu.Unlock()
+		g.log.Info("detected a model still starting", "active", Key{name, v}.String())
+		return
+	}
 	g.log.Info("no model active at startup")
 }
 

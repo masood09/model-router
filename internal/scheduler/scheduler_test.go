@@ -442,6 +442,24 @@ func TestSameVariantStillLoadingIsAwaitedNotRestarted(t *testing.T) {
 	}
 }
 
+func TestDetectAdoptsBackendStillStarting(t *testing.T) {
+	st := newStarting(&fake{current: "large", up: true}, true)
+	st.readyAt.Store(time.Now().Add(150 * time.Millisecond).UnixNano())
+	g := newGroup(map[string]Lifecycle{"a": st}, 5*time.Second)
+	g.Detect(context.Background())
+	if s := g.State(); s.Active != (Key{"a", "large"}) || s.Ready {
+		t.Fatalf("state = %+v, want a/large not ready", s)
+	}
+	rel, _, err := g.Acquire(context.Background(), Key{"a", "large"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel()
+	if acts := st.acts(); len(acts) != 0 {
+		t.Fatalf("restarted a backend that was still starting: %v", acts)
+	}
+}
+
 func TestSameVariantStoppedIsRestarted(t *testing.T) {
 	f := &fake{current: "large", up: true}
 	st := newStarting(f, true)
