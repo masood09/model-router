@@ -1,0 +1,351 @@
+// Package scheduler serialises model switches within a resource group.
+//
+// A group runs one (backend, variant) at a time. Requests for the active,
+// ready variant pass straight through. A request for anything else joins a
+// FIFO queue; once nothing is in flight the scheduler switches to the queue
+// head's variant and releases every waiter for it. While a switch is pending,
+// new requests for the current variant queue too, so a steady stream of them
+// cannot starve the waiting variant. In-flight requests are never cut off.
+package scheduler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+)
+
+// Key identifies a backend variant.
+type Key struct {
+	Backend string
+	Variant string
+}
+
+// String renders the key for logs and metrics.
+func (k Key) String() string {
+	if k.Backend == "" {
+		return "none"
+	}
+	return k.Backend + "/" + k.Variant
+}
+
+// Lifecycle is what the scheduler needs from a backend.
+type Lifecycle interface {
+	Activate(ctx context.Context, variant string) error
+	Deactivate(ctx context.Context) error
+	WaitReady(ctx context.Context) error
+	Ready(ctx context.Context) bool
+	Current() (string, error)
+}
+
+// Errors returned by Acquire.
+var (
+	ErrQueueFull = errors.New("too many requests waiting for a model switch")
+	ErrTimeout   = errors.New("timed out waiting for the model to become active")
+	ErrSwitch    = errors.New("model switch failed")
+)
+
+// Observer receives scheduler events, for metrics. Any field may be nil.
+type Observer struct {
+	Switch    func(group string, from, to Key, d time.Duration, err error)
+	QueueWait func(group string, d time.Duration)
+}
+
+// Options configures a Group.
+type Options struct {
+	Name       string
+	MaxWaiters int
+	MaxWait    time.Duration
+	Refresh    time.Duration
+	Backends   map[string]Lifecycle
+	Observer   Observer
+	Logger     *slog.Logger
+}
+
+type ticket struct {
+	key  Key
+	done chan error // buffered(1); nil = granted (inflight already counted)
+}
+
+// Group is the scheduler of one resource group.
+type Group struct {
+	name       string
+	maxWaiters int
+	maxWait    time.Duration
+	refresh    time.Duration
+	backends   map[string]Lifecycle
+	obs        Observer
+	log        *slog.Logger
+
+	mu        sync.Mutex
+	active    Key
+	ready     bool
+	switching bool
+	inflight  int
+	queue     []*ticket
+}
+
+// New creates a group scheduler. Call Detect before serving and Run to keep
+// the readiness state fresh.
+func New(o Options) *Group {
+	log := o.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Group{
+		name:       o.Name,
+		maxWaiters: o.MaxWaiters,
+		maxWait:    o.MaxWait,
+		refresh:    o.Refresh,
+		backends:   o.Backends,
+		obs:        o.Observer,
+		log:        log.With("group", o.Name),
+	}
+}
+
+// State is a snapshot of a group.
+type State struct {
+	Active    Key
+	Ready     bool
+	Switching bool
+	InFlight  int
+	Waiting   int
+}
+
+// State returns a snapshot without probing anything.
+func (g *Group) State() State {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return State{Active: g.active, Ready: g.ready, Switching: g.switching, InFlight: g.inflight, Waiting: len(g.queue)}
+}
+
+// Detect works out which backend variant is currently serving by probing
+// each backend. If none is ready, the group starts with nothing active and
+// the first request triggers a switch.
+func (g *Group) Detect(ctx context.Context) {
+	for name, b := range g.backends {
+		if !b.Ready(ctx) {
+			continue
+		}
+		v, err := b.Current()
+		if err != nil || v == "" {
+			continue
+		}
+		g.mu.Lock()
+		if !g.switching {
+			g.active, g.ready = Key{name, v}, true
+		}
+		g.mu.Unlock()
+		g.log.Info("detected active model", "active", Key{name, v}.String())
+		return
+	}
+	g.log.Info("no model active at startup")
+}
+
+// Run re-probes the active backend every refresh interval until ctx ends.
+func (g *Group) Run(ctx context.Context) {
+	t := time.NewTicker(g.refresh)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			g.refreshOnce(ctx)
+		}
+	}
+}
+
+func (g *Group) refreshOnce(ctx context.Context) {
+	g.mu.Lock()
+	if g.switching {
+		g.mu.Unlock()
+		return
+	}
+	snap := g.active
+	g.mu.Unlock()
+	if snap.Backend == "" {
+		g.Detect(ctx)
+		return
+	}
+	ok := g.backends[snap.Backend].Ready(ctx)
+	g.mu.Lock()
+	if !g.switching && g.active == snap && g.ready != ok {
+		g.ready = ok
+		g.log.Info("readiness changed", "active", snap.String(), "ready", ok)
+		if ok {
+			g.kick()
+		}
+	}
+	g.mu.Unlock()
+}
+
+// MarkUnready records that the upstream of key failed a request, so the next
+// request re-checks it instead of assuming it is up.
+func (g *Group) MarkUnready(key Key) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.switching && g.active == key {
+		g.ready = false
+	}
+}
+
+// Acquire waits until key is the group's active, ready variant and counts
+// the caller as in flight. The returned release must be called exactly once
+// when the request is finished. It also returns how long the caller waited.
+func (g *Group) Acquire(ctx context.Context, key Key) (release func(), waited time.Duration, err error) {
+	if _, ok := g.backends[key.Backend]; !ok {
+		return nil, 0, fmt.Errorf("backend %q is not in group %q", key.Backend, g.name)
+	}
+	g.mu.Lock()
+	if !g.switching && len(g.queue) == 0 && g.ready && g.active == key {
+		g.inflight++
+		g.mu.Unlock()
+		return g.releaser(), 0, nil
+	}
+	if len(g.queue) >= g.maxWaiters {
+		g.mu.Unlock()
+		return nil, 0, ErrQueueFull
+	}
+	t := &ticket{key: key, done: make(chan error, 1)}
+	g.queue = append(g.queue, t)
+	g.kick()
+	g.mu.Unlock()
+
+	start := time.Now()
+	timer := time.NewTimer(g.maxWait)
+	defer timer.Stop()
+	defer func() {
+		waited = time.Since(start)
+		if g.obs.QueueWait != nil {
+			g.obs.QueueWait(g.name, waited)
+		}
+	}()
+
+	select {
+	case err := <-t.done:
+		if err != nil {
+			return nil, 0, err
+		}
+		return g.releaser(), 0, nil
+	case <-ctx.Done():
+		return nil, 0, g.abandon(t, ctx.Err())
+	case <-timer.C:
+		return nil, 0, g.abandon(t, ErrTimeout)
+	}
+}
+
+// abandon removes a waiting ticket. If it was granted concurrently, the
+// grant is returned (released) so the in-flight count stays correct.
+func (g *Group) abandon(t *ticket, cause error) error {
+	g.mu.Lock()
+	for i, q := range g.queue {
+		if q == t {
+			g.queue = append(g.queue[:i], g.queue[i+1:]...)
+			g.kick()
+			g.mu.Unlock()
+			return cause
+		}
+	}
+	g.mu.Unlock()
+	if err := <-t.done; err == nil {
+		g.releaser()()
+	}
+	return cause
+}
+
+func (g *Group) releaser() func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			g.mu.Lock()
+			g.inflight--
+			if g.inflight == 0 {
+				g.kick()
+			}
+			g.mu.Unlock()
+		})
+	}
+}
+
+// kick advances the queue. It must be called with g.mu held.
+func (g *Group) kick() {
+	if g.switching || len(g.queue) == 0 {
+		return
+	}
+	head := g.queue[0].key
+	if head == g.active && g.ready {
+		g.grantLocked(head, nil)
+		return
+	}
+	if g.inflight > 0 {
+		return // switch once the current requests finish
+	}
+	g.switching = true
+	from := g.active
+	go g.switchTo(from, head)
+}
+
+// grantLocked completes every waiter for key with err (nil = granted).
+func (g *Group) grantLocked(key Key, err error) {
+	kept := g.queue[:0]
+	for _, t := range g.queue {
+		if t.key != key {
+			kept = append(kept, t)
+			continue
+		}
+		if err == nil {
+			g.inflight++
+		}
+		t.done <- err
+	}
+	for i := len(kept); i < len(g.queue); i++ {
+		g.queue[i] = nil
+	}
+	g.queue = kept
+}
+
+func (g *Group) switchTo(from, to Key) {
+	ctx := context.Background() // bounded by the drivers' and probe's own timeouts
+	start := time.Now()
+	g.log.Info("switching model", "from", from.String(), "to", to.String())
+
+	err := g.doSwitch(ctx, from, to)
+	d := time.Since(start)
+
+	g.mu.Lock()
+	g.switching = false
+	if err != nil {
+		g.active, g.ready = to, false
+		err = fmt.Errorf("%w: %s: %v", ErrSwitch, to, err)
+		g.grantLocked(to, err)
+		g.log.Error("model switch failed", "to", to.String(), "duration", d.String(), "error", err)
+	} else {
+		g.active, g.ready = to, true
+		g.log.Info("model switched", "from", from.String(), "to", to.String(), "duration", d.String())
+	}
+	if g.obs.Switch != nil {
+		g.obs.Switch(g.name, from, to, d, err)
+	}
+	g.kick()
+	g.mu.Unlock()
+}
+
+func (g *Group) doSwitch(ctx context.Context, from, to Key) error {
+	target := g.backends[to.Backend]
+	// The same variant that merely looked down: re-check before restarting.
+	if from == to && target.Ready(ctx) {
+		return nil
+	}
+	if from.Backend != "" && from.Backend != to.Backend {
+		if err := g.backends[from.Backend].Deactivate(ctx); err != nil {
+			return fmt.Errorf("deactivate %s: %w", from.Backend, err)
+		}
+	}
+	if err := target.Activate(ctx, to.Variant); err != nil {
+		return fmt.Errorf("activate: %w", err)
+	}
+	return target.WaitReady(ctx)
+}
