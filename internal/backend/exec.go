@@ -39,7 +39,11 @@ func output(ctx context.Context, timeout time.Duration, argv []string) (string, 
 	// #nosec G204 -- argv comes from validated configuration, never a shell.
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	out := &limitedBuffer{max: maxCommandOutput}
+	// stderr is captured, never inherited: the router's own stderr is a JSON
+	// log stream, and raw diagnostics there would break log pipelines.
+	diag := &limitedBuffer{max: maxCommandOutput}
 	cmd.Stdout = out
+	cmd.Stderr = diag
 	cmd.Stdin = nil
 	cmd.WaitDelay = 5 * time.Second
 	err := cmd.Run()
@@ -47,6 +51,9 @@ func output(ctx context.Context, timeout time.Duration, argv []string) (string, 
 	if s == "" {
 		if err == nil {
 			err = fmt.Errorf("%s printed nothing", argv[0])
+		}
+		if msg := strings.TrimSpace(diag.buf.String()); msg != "" {
+			err = fmt.Errorf("%w: %s", err, msg)
 		}
 		return "", err
 	}

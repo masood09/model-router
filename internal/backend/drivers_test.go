@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -142,7 +143,7 @@ func TestSystemdRunning(t *testing.T) {
 		{"something-new", 3, false, false},
 	}
 	for _, c := range cases {
-		prog, log := fakeProgram(t, "echo '"+c.print+"'; exit "+string(rune('0'+c.exit))+"\n")
+		prog, log := fakeProgram(t, "echo '"+c.print+"'; exit "+strconv.Itoa(c.exit)+"\n")
 		d := NewSystemd(config.SystemdDriver{Unit: "llm-backend.service", Systemctl: prog, ActionTimeout: config.Duration(5 * time.Second)})
 		running, ok := d.Running(context.Background())
 		if running != c.running || ok != c.ok {
@@ -151,6 +152,21 @@ func TestSystemdRunning(t *testing.T) {
 		if got := calls(t, log); len(got) != 1 || strings.Join(got[0], " ") != "--no-ask-password is-active llm-backend.service" {
 			t.Errorf("argv = %v", got)
 		}
+	}
+}
+
+func TestOutputCapturesStderr(t *testing.T) {
+	// stdout is the answer; stderr noise must not reach it (or the process's
+	// own stderr, which is the router's JSON log).
+	prog, _ := fakeProgram(t, "echo 'Warning: unit file changed on disk' >&2; echo active\n")
+	if got, err := output(context.Background(), 5*time.Second, []string{prog}); err != nil || got != "active" {
+		t.Fatalf("output = %q, %v", got, err)
+	}
+	// With no stdout, stderr becomes the error's context.
+	prog, _ = fakeProgram(t, "echo 'Failed to connect to bus' >&2; exit 1\n")
+	_, err := output(context.Background(), 5*time.Second, []string{prog})
+	if err == nil || !strings.Contains(err.Error(), "Failed to connect to bus") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
