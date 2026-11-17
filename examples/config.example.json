@@ -1,0 +1,67 @@
+{
+  "listen": "127.0.0.1:8922",
+  "defaultModel": "local-large",
+  "unknownModel": "loaded",
+  "passthrough": "default",
+
+  "timeouts": {
+    "shutdownGrace": "60s",
+    "upstreamResponseHeader": "30m"
+  },
+
+  "auth": {
+    "clientTokensFile": "/run/secrets/model-router/client-tokens"
+  },
+
+  "groups": {
+    "gpu0": { "maxWait": "20m", "maxWaiters": 256, "stateRefresh": "15s" }
+  },
+
+  "backends": {
+    "local-llm": {
+      "group": "gpu0",
+      "upstream": "http://127.0.0.1:8001",
+      "driver": {
+        "kind": "systemd",
+        "systemd": {
+          "unit": "llm-backend.service",
+          "selectionFile": "/var/lib/model-router/llm-variant",
+          "defaultVariant": "large",
+          "actionTimeout": "15m"
+        }
+      },
+      "readiness": {
+        "path": "/v1/models",
+        "bodyContains": "\"loaded\"",
+        "interval": "2s",
+        "timeout": "15m"
+      }
+    },
+    "container-llm": {
+      "group": "gpu0",
+      "upstream": "http://127.0.0.1:8002",
+      "driver": {
+        "kind": "command",
+        "command": {
+          "activate": ["/usr/bin/docker", "restart", "llm-{variant}"],
+          "deactivate": ["/usr/bin/docker", "stop", "llm-large", "llm-small"],
+          "actionTimeout": "5m"
+        }
+      },
+      "readiness": { "path": "/health", "timeout": "10m" }
+    },
+    "hosted": {
+      "upstream": "https://api.example.org",
+      "upstreamTokenFile": "/run/secrets/model-router/hosted-token",
+      "driver": { "kind": "static" }
+    }
+  },
+
+  "models": {
+    "local-large":            { "backend": "local-llm", "variant": "large", "inject": { "some_flag": false } },
+    "local-large-variant-b":  { "backend": "local-llm", "variant": "large", "inject": { "some_flag": true } },
+    "local-small":            { "backend": "local-llm", "variant": "small" },
+    "container-small":        { "backend": "container-llm", "variant": "small" },
+    "hosted-model":           { "backend": "hosted" }
+  }
+}
