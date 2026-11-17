@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"regexp"
@@ -143,6 +144,14 @@ func (r *Router) newReverseProxy(b *backend.Backend, transport http.RoundTripper
 			if rt, ok := req.Context().Value(ctxKey{}).(*route); ok && rt.group != nil {
 				rt.group.MarkUnready(rt.key)
 			}
+			// The connection was refused or never made, so the request was
+			// not sent: let serveModel wait for the backend and retry, instead
+			// of failing a request that only raced a restart.
+			if a, ok := req.Context().Value(attemptKey{}).(*attempt); ok && a.retryable && isDialError(err) {
+				a.dialFailed = true
+				r.log.Info("upstream not accepting connections; waiting to retry", "backend", b.Name)
+				return
+			}
 			r.log.Warn("upstream error", "backend", b.Name, "error", err.Error())
 			writeError(w, http.StatusBadGateway, "upstream_error", "bad_gateway", "the model server could not be reached", 5)
 		},
@@ -247,23 +256,54 @@ func (r *Router) serveModel(w *recorder, req *http.Request) (label, target strin
 		return label, target, 0
 	}
 
-	if rt.group != nil {
-		release, waited, err := rt.group.Acquire(req.Context(), rt.key)
-		queued = waited
-		if err != nil {
-			r.acquireError(w, req, err)
-			return label, target, queued
-		}
-		defer release()
-	}
-
-	req.Body = io.NopCloser(bytes.NewReader(out))
 	req.ContentLength = int64(len(out))
 	req.Header.Set("Content-Length", strconv.Itoa(len(out)))
 	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(out)), nil }
-	req = req.WithContext(context.WithValue(req.Context(), ctxKey{}, rt))
-	r.proxies[rt.key.Backend].ServeHTTP(w, req)
-	return label, target, queued
+	base := context.WithValue(req.Context(), ctxKey{}, rt)
+
+	// A scheduled backend can be mid-restart (by a deploy, or anyone) before
+	// the router's state has caught up. A refused connection means nothing
+	// was sent, so the request waits for the backend like any queued request
+	// and is retried once; any other upstream failure is reported at once.
+	for try := 0; ; try++ {
+		var release func()
+		if rt.group != nil {
+			var waited time.Duration
+			var err error
+			release, waited, err = rt.group.Acquire(req.Context(), rt.key)
+			queued += waited
+			if err != nil {
+				r.acquireError(w, req, err)
+				return label, target, queued
+			}
+		}
+		a := &attempt{retryable: rt.group != nil && try == 0}
+		attemptReq := req.WithContext(context.WithValue(base, attemptKey{}, a))
+		attemptReq.Body = io.NopCloser(bytes.NewReader(out))
+		r.proxies[rt.key.Backend].ServeHTTP(w, attemptReq)
+		if release != nil {
+			release()
+		}
+		if !a.dialFailed {
+			return label, target, queued
+		}
+	}
+}
+
+// attempt records, per proxied attempt, whether it may be retried and
+// whether it failed before reaching the upstream.
+type attempt struct {
+	retryable  bool
+	dialFailed bool
+}
+
+type attemptKey struct{}
+
+// isDialError reports whether err happened while connecting, so the request
+// was never sent upstream.
+func isDialError(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
 }
 
 func (r *Router) acquireError(w http.ResponseWriter, req *http.Request, err error) {

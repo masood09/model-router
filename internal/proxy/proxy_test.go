@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -455,6 +456,45 @@ func TestUpstreamDownGives502AndMarksUnready(t *testing.T) {
 	}
 	if h.group.State().Ready {
 		t.Fatal("group still marked ready after an upstream failure")
+	}
+}
+
+// refuseOnce fails the first round trip the way a backend that is mid-restart
+// does (connection refused), then delegates.
+type refuseOnce struct {
+	next    http.RoundTripper
+	mu      sync.Mutex
+	refused int
+}
+
+func (r *refuseOnce) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	first := r.refused == 0
+	if first {
+		r.refused++
+	}
+	r.mu.Unlock()
+	if first {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	}
+	return r.next.RoundTrip(req)
+}
+
+func TestRefusedConnectionIsRetriedAfterWaiting(t *testing.T) {
+	tr := &refuseOnce{next: http.DefaultTransport}
+	h := newHarness(t, "", func(o *Options) { o.Transport = tr })
+	resp := h.post(t, "/v1/chat/completions", `{"model":"big","messages":[]}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d, want 200 after the retry", resp.StatusCode)
+	}
+	if tr.refused != 1 || h.up.count() != 1 {
+		t.Fatalf("refused %d, upstream saw %d requests", tr.refused, h.up.count())
+	}
+	if got := h.up.last(t).body["flag"]; got != false {
+		t.Fatalf("retried body lost its injection: flag=%v", got)
+	}
+	if acts := h.life.acts(); len(acts) != 0 {
+		t.Fatalf("a backend that was up got restarted: %v", acts)
 	}
 }
 
