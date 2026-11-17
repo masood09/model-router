@@ -1,0 +1,94 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go (lint, vuln, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "::error::gofmt needed:"; echo "$unformatted"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2026.1 ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+      - name: test (race, coverage)
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+      - name: coverage gate (internal packages >= 80%)
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          grep -v '/cmd/' coverage.out > coverage.internal.out
+          pct="$(go tool cover -func=coverage.internal.out | awk '/^total:/ {sub("%","",$3); print $3}')"
+          echo "internal coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p >= 80) ? 0 : 1 }'
+      - name: fuzz (short)
+        run: |
+          go test -run '^$' -fuzz=FuzzParse -fuzztime=30s ./internal/config
+          go test -run '^$' -fuzz=FuzzParseBody -fuzztime=30s ./internal/proxy
+      - name: benchmarks (smoke)
+        run: go test -run '^$' -bench . -benchtime=500x ./internal/proxy
+
+  nix:
+    name: Nix (build, flake check, VM test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+        with:
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+      - name: enable KVM for the VM test
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: nix flake check
+        run: nix flake check -L
+      - name: nix build
+        run: nix build -L && ./result/bin/model-router -version
+
+  docker:
+    name: Docker (build and smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: model-router:ci
+          build-args: VERSION=ci
+      - name: smoke test
+        run: |
+          docker run --rm model-router:ci -version
+          docker run --rm -v "$PWD/examples:/etc/model-router:ro" model-router:ci \
+            -check-config -config /etc/model-router/config.example.json
+          docker run --rm --entrypoint "" model-router:ci /usr/local/bin/model-router -version
+          test "$(docker inspect -f '{{.Config.User}}' model-router:ci)" = "nonroot:nonroot"
