@@ -27,6 +27,11 @@ type Server struct {
 	router  *proxy.Router
 	groups  map[string]*scheduler.Group
 	metrics *metrics.Registry
+
+	// bg scopes background work: readiness refresh and switches. It ends
+	// when Serve returns, after the drain.
+	bg     context.Context
+	stopBG context.CancelFunc
 }
 
 // lifecycle adapts a backend to scheduler.Lifecycle.
@@ -97,6 +102,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		QueueWait: func(group string, d time.Duration) { queueWait.Observe(d, group) },
 	}
 
+	bg, stopBG := context.WithCancel(context.Background())
 	groups := map[string]*scheduler.Group{}
 	for gname, gc := range cfg.Groups {
 		members := map[string]scheduler.Lifecycle{}
@@ -110,7 +116,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		}
 		groups[gname] = scheduler.New(scheduler.Options{
 			Name: gname, MaxWaiters: gc.MaxWaiters, MaxWait: gc.MaxWait.D(), Refresh: gc.StateRefresh.D(),
-			Backends: members, Observer: obs, Logger: log,
+			Backends: members, Observer: obs, Logger: log, Context: bg,
 		})
 	}
 	registerGauges(reg, groups)
@@ -125,6 +131,8 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		router:  router,
 		groups:  groups,
 		metrics: reg,
+		bg:      bg,
+		stopBG:  stopBG,
 		http: &http.Server{
 			Addr:              cfg.Listen,
 			Handler:           router,
@@ -190,11 +198,11 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // draining (readyz fails), stops accepting connections, then waits up to
 // the configured grace period for in-flight requests, including streams.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
-	bg, stopBG := context.WithCancel(context.Background())
-	defer stopBG()
+	// Switches still running when the drain ends are cancelled with bg.
+	defer s.stopBG()
 	for _, g := range s.groups {
-		g.Detect(bg)
-		go g.Run(bg)
+		g.Detect(s.bg)
+		go g.Run(s.bg)
 	}
 
 	errc := make(chan error, 1)
