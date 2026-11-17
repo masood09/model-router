@@ -339,6 +339,12 @@ func TestBadRequests(t *testing.T) {
 	if resp := h.post(t, "/v1/chat/completions", `not json`); resp.StatusCode != 400 {
 		t.Fatalf("invalid JSON: %d", resp.StatusCode)
 	}
+	dup := h.post(t, "/v1/chat/completions", `{"model":"big","model":"small"}`)
+	var e apiError
+	_ = json.NewDecoder(dup.Body).Decode(&e)
+	if dup.StatusCode != 400 || e.Error.Code != "duplicate_key" {
+		t.Fatalf("duplicate key: %d %+v", dup.StatusCode, e)
+	}
 	if resp := h.post(t, "/v1/chat/completions", `["array"]`); resp.StatusCode != 400 {
 		t.Fatalf("array body: %d", resp.StatusCode)
 	}
@@ -365,6 +371,9 @@ func TestModelsList(t *testing.T) {
 	got := map[string]string{}
 	for _, m := range out.Data {
 		got[m.ID] = m.Status.Value
+		if m.Created <= 0 {
+			t.Errorf("%s: created = %d, want the router's start time", m.ID, m.Created)
+		}
 	}
 	want := map[string]string{"big": "loaded", "big-alt": "loaded", "small": "unloaded"}
 	for k, v := range want {

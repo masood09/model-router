@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 )
 
-var errNotObject = errors.New("request body must be a JSON object")
+var (
+	errNotObject    = errors.New("request body must be a JSON object")
+	errDuplicateKey = errors.New("request body has a duplicate top-level key")
+)
 
 // requestBody is a decoded JSON request body. Values stay raw, so fields the
 // router does not touch are forwarded byte for byte.
@@ -15,18 +19,43 @@ type requestBody struct {
 	raw    []byte
 }
 
-// parseBody decodes a JSON object without interpreting its values.
+// parseBody decodes a JSON object without interpreting its values, in one
+// streaming pass. Duplicate top-level keys are rejected: the original bytes
+// are forwarded when nothing is injected, and a re-encoding otherwise, and
+// the two must never disagree about which duplicate wins.
 func parseBody(raw []byte) (*requestBody, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, errNotObject
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(trimmed, &fields); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	if _, err := dec.Token(); err != nil { // the opening '{'
 		return nil, err
 	}
-	if fields == nil {
-		return nil, errNotObject
+	fields := map[string]json.RawMessage{}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return nil, errNotObject
+		}
+		if _, dup := fields[key]; dup {
+			return nil, errDuplicateKey
+		}
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return nil, err
+		}
+		fields[key] = v
+	}
+	if _, err := dec.Token(); err != nil { // the closing '}'
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("trailing data after the JSON object")
 	}
 	return &requestBody{fields: fields, raw: raw}, nil
 }

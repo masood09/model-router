@@ -63,6 +63,7 @@ type Router struct {
 	admin      *auth.Tokens
 	log        *slog.Logger
 	draining   atomic.Bool
+	created    int64 // reported as each model's "created" in /v1/models
 
 	mReg      *metrics.Registry
 	mRequests *metrics.Counter
@@ -87,6 +88,7 @@ func New(o Options) *Router {
 		admin:      o.AdminTokens,
 		log:        log,
 		mReg:       o.Metrics,
+		created:    time.Now().Unix(),
 	}
 	for _, p := range o.Config.ModelPaths {
 		r.modelPaths[p] = true
@@ -220,6 +222,10 @@ func (r *Router) serveModel(w *recorder, req *http.Request) (label, target strin
 		return label, "", 0
 	}
 	body, err := parseBody(raw)
+	if errors.Is(err, errDuplicateKey) {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "duplicate_key", "request body has a duplicate top-level key", 0)
+		return label, "", 0
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", "request body must be a JSON object", 0)
 		return label, "", 0
@@ -347,7 +353,7 @@ func (r *Router) serveModels(w http.ResponseWriter) {
 				status = "unloaded"
 			}
 		}
-		data = append(data, modelEntry{ID: name, Object: "model", OwnedBy: rt.backend.Name, Status: modelStatus{status}})
+		data = append(data, modelEntry{ID: name, Object: "model", Created: r.created, OwnedBy: rt.backend.Name, Status: modelStatus{status}})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }

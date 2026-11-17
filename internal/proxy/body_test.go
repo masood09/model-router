@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -37,6 +38,24 @@ func TestParseBodyRejects(t *testing.T) {
 		if _, err := parseBody([]byte(s)); err == nil {
 			t.Errorf("%q accepted", s)
 		}
+	}
+}
+
+func TestParseBodyRejectsDuplicateKeys(t *testing.T) {
+	for _, s := range []string{
+		`{"model":"a","model":"b"}`,
+		`{"stream":true,"x":1,"stream":false}`,
+	} {
+		if _, err := parseBody([]byte(s)); !errors.Is(err, errDuplicateKey) {
+			t.Errorf("%s: err = %v, want errDuplicateKey", s, err)
+		}
+	}
+	// Duplicates inside nested values are the upstream's business.
+	if _, err := parseBody([]byte(`{"messages":[{"a":1,"a":2}]}`)); err != nil {
+		t.Errorf("nested duplicate rejected: %v", err)
+	}
+	if _, err := parseBody([]byte(`{"a":1} {"b":2}`)); err == nil {
+		t.Error("trailing object accepted")
 	}
 }
 
