@@ -215,8 +215,18 @@ func TestSwitchesForAnotherVariant(t *testing.T) {
 	if acts := h.life.acts(); len(acts) != 1 || acts[0] != "small" {
 		t.Fatalf("activations = %v", acts)
 	}
-	if st := h.group.State(); st.Active.Variant != "small" || st.InFlight != 0 {
-		t.Fatalf("state = %+v", st)
+	// The in-flight slot is released as the handler returns, which can trail
+	// the client reading the response, so poll briefly.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		st := h.group.State()
+		if st.Active.Variant == "small" && st.InFlight == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("state = %+v", st)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
