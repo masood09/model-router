@@ -29,6 +29,30 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// output executes argv with a timeout and returns its trimmed standard output
+// whatever the exit status, for state queries such as `systemctl is-active`,
+// which report through stdout and exit non-zero for anything but "active".
+// It fails only if the program could not run or printed nothing.
+func output(ctx context.Context, timeout time.Duration, argv []string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	// #nosec G204 -- argv comes from validated configuration, never a shell.
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	out := &limitedBuffer{max: maxCommandOutput}
+	cmd.Stdout = out
+	cmd.Stdin = nil
+	cmd.WaitDelay = 5 * time.Second
+	err := cmd.Run()
+	s := strings.TrimSpace(out.buf.String())
+	if s == "" {
+		if err == nil {
+			err = fmt.Errorf("%s printed nothing", argv[0])
+		}
+		return "", err
+	}
+	return s, nil
+}
+
 // run executes argv with a timeout. It never uses a shell; arguments are
 // passed to the program exactly as given. Combined output is captured
 // (bounded) and included in the error on failure.

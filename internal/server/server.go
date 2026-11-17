@@ -43,6 +43,18 @@ func (l lifecycle) WaitReady(ctx context.Context) error          { return l.b.Wa
 func (l lifecycle) Ready(ctx context.Context) bool               { return l.b.Ready(ctx) }
 func (l lifecycle) Current() (string, error)                     { return l.b.Driver.Current() }
 
+// Running forwards to drivers that can report their process state, so the
+// scheduler waits for a backend that is still loading instead of
+// restarting it.
+func (l lifecycle) Running(ctx context.Context) (running, ok bool) {
+	if r, isRunner := l.b.Driver.(interface {
+		Running(context.Context) (bool, bool)
+	}); isRunner {
+		return r.Running(ctx)
+	}
+	return false, false
+}
+
 // NewTransport returns the shared upstream transport. It ignores proxy
 // environment variables so upstream traffic always goes where it is
 // configured to.

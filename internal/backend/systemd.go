@@ -61,6 +61,24 @@ func (s *Systemd) Deactivate(ctx context.Context) error {
 	return run(ctx, s.timeout, []string{s.systemctl, "--no-ask-password", "stop", s.unit})
 }
 
+// Running reports whether the unit is up or on its way up (systemd's
+// "active", "activating", "reloading" or "refreshing"). ok is false when the
+// state could not be read. It only queries state, so it needs no polkit rule.
+func (s *Systemd) Running(ctx context.Context) (running, ok bool) {
+	state, err := output(ctx, s.timeout, []string{s.systemctl, "--no-ask-password", "is-active", s.unit})
+	if err != nil {
+		return false, false
+	}
+	switch state {
+	case "active", "activating", "reloading", "refreshing":
+		return true, true
+	case "inactive", "failed", "deactivating", "maintenance":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // Current returns the variant in the selection file, or the default variant
 // if the file does not exist yet.
 func (s *Systemd) Current() (string, error) {

@@ -126,6 +126,34 @@ func TestSystemdTimeout(t *testing.T) {
 	}
 }
 
+func TestSystemdRunning(t *testing.T) {
+	cases := []struct {
+		print       string
+		exit        int
+		running, ok bool
+	}{
+		{"active", 0, true, true},
+		{"activating", 3, true, true},
+		{"reloading", 0, true, true},
+		{"inactive", 3, false, true},
+		{"failed", 3, false, true},
+		{"deactivating", 3, false, true},
+		{"", 4, false, false},
+		{"something-new", 3, false, false},
+	}
+	for _, c := range cases {
+		prog, log := fakeProgram(t, "echo '"+c.print+"'; exit "+string(rune('0'+c.exit))+"\n")
+		d := NewSystemd(config.SystemdDriver{Unit: "llm-backend.service", Systemctl: prog, ActionTimeout: config.Duration(5 * time.Second)})
+		running, ok := d.Running(context.Background())
+		if running != c.running || ok != c.ok {
+			t.Errorf("%q (exit %d): Running = %v, %v; want %v, %v", c.print, c.exit, running, ok, c.running, c.ok)
+		}
+		if got := calls(t, log); len(got) != 1 || strings.Join(got[0], " ") != "--no-ask-password is-active llm-backend.service" {
+			t.Errorf("argv = %v", got)
+		}
+	}
+}
+
 func TestSystemdCurrentRejectsGarbage(t *testing.T) {
 	sel := filepath.Join(t.TempDir(), "variant")
 	if err := os.WriteFile(sel, []byte("rm -rf /\n"), 0o644); err != nil {

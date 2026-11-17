@@ -45,6 +45,14 @@ type Lifecycle interface {
 	Current() (string, error)
 }
 
+// Runner is implemented by lifecycles that can tell whether the backend's
+// process is up or starting (for example a systemd unit that is active or
+// activating). It lets the scheduler wait for a backend that is merely still
+// loading instead of restarting it. ok is false when the state is unknown.
+type Runner interface {
+	Running(ctx context.Context) (running, ok bool)
+}
+
 // Errors returned by Acquire.
 var (
 	ErrQueueFull = errors.New("too many requests waiting for a model switch")
@@ -360,9 +368,19 @@ func (g *Group) switchTo(from, to Key) {
 
 func (g *Group) doSwitch(ctx context.Context, from, to Key) error {
 	target := g.backends[to.Backend]
-	// The same variant that merely looked down: re-check before restarting.
-	if from == to && target.Ready(ctx) {
-		return nil
+	if from == to {
+		// The same variant that merely looked down: re-check before restarting.
+		if target.Ready(ctx) {
+			return nil
+		}
+		// Still starting or loading (e.g. right after a deploy restarted it):
+		// wait for it instead of throwing the load away with a restart.
+		if r, ok := target.(Runner); ok {
+			if running, known := r.Running(ctx); known && running {
+				g.log.Info("backend is starting; waiting for it instead of restarting", "active", to.String())
+				return target.WaitReady(ctx)
+			}
+		}
 	}
 	if from.Backend != "" && from.Backend != to.Backend {
 		if err := g.backends[from.Backend].Deactivate(ctx); err != nil {

@@ -394,6 +394,78 @@ func TestKeyString(t *testing.T) {
 	}
 }
 
+// starting is a fake whose process is up (Running) but whose model is still
+// loading: Ready turns true only after a delay.
+type starting struct {
+	*fake
+	readyAt atomic.Int64 // unix nanoseconds
+	running atomic.Bool
+	known   bool
+}
+
+func newStarting(f *fake, running bool) *starting {
+	s := &starting{fake: f, known: true}
+	s.running.Store(running)
+	s.readyAt.Store(time.Now().UnixNano())
+	return s
+}
+
+func (s *starting) Ready(context.Context) bool {
+	return s.running.Load() && time.Now().UnixNano() > s.readyAt.Load()
+}
+func (s *starting) WaitReady(ctx context.Context) error {
+	for !s.Ready(ctx) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	return nil
+}
+func (s *starting) Running(context.Context) (bool, bool) { return s.running.Load(), s.known }
+
+func TestSameVariantStillLoadingIsAwaitedNotRestarted(t *testing.T) {
+	st := newStarting(&fake{current: "large", up: true}, true)
+	g := newGroup(map[string]Lifecycle{"a": st}, 5*time.Second)
+	g.Detect(context.Background())
+	// A deploy restarted the backend: it is up but loading for a while.
+	g.MarkUnready(Key{"a", "large"})
+	st.readyAt.Store(time.Now().Add(150 * time.Millisecond).UnixNano())
+	rel, _, err := g.Acquire(context.Background(), Key{"a", "large"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel()
+	if acts := st.acts(); len(acts) != 0 {
+		t.Fatalf("restarted a backend that was still loading: %v", acts)
+	}
+}
+
+func TestSameVariantStoppedIsRestarted(t *testing.T) {
+	f := &fake{current: "large", up: true}
+	st := newStarting(f, true)
+	g := newGroup(map[string]Lifecycle{"a": st}, 5*time.Second)
+	g.Detect(context.Background())
+	g.MarkUnready(Key{"a", "large"})
+	st.running.Store(false) // stopped: not coming back on its own
+	go func() {
+		// Activate brings it back.
+		for len(f.acts()) == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		st.running.Store(true)
+	}()
+	rel, _, err := g.Acquire(context.Background(), Key{"a", "large"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel()
+	if acts := f.acts(); len(acts) != 1 {
+		t.Fatalf("stopped backend not restarted exactly once: %v", acts)
+	}
+}
+
 func TestDetectIsDeterministic(t *testing.T) {
 	for range 20 {
 		backends := map[string]Lifecycle{
