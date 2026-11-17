@@ -98,6 +98,84 @@ func TestDetectAndFastPath(t *testing.T) {
 	}
 }
 
+// heldFake is a fake that another process can park.
+type heldFake struct {
+	*fake
+	held atomic.Bool
+}
+
+func (h *heldFake) Held() bool { return h.held.Load() }
+
+func TestHeldBackendIsNeverStarted(t *testing.T) {
+	a := &heldFake{fake: &fake{current: "large", up: true}}
+	g := newGroup(map[string]Lifecycle{"a": a}, time.Second)
+	g.Detect(context.Background())
+	a.held.Store(true)
+
+	_, _, err := g.Acquire(context.Background(), Key{"a", "small"})
+	if !errors.Is(err, ErrHeld) {
+		t.Fatalf("Acquire = %v, want ErrHeld", err)
+	}
+	if acts := a.acts(); len(acts) != 0 {
+		t.Fatalf("activated a held backend: %v", acts)
+	}
+	if s := g.State(); s.Active != (Key{"a", "large"}) || !s.Ready || s.Switching {
+		t.Fatalf("a refused switch changed the state: %+v", s)
+	}
+
+	// Released: the same request now switches normally.
+	a.held.Store(false)
+	rel, _, err := g.Acquire(context.Background(), Key{"a", "small"})
+	if err != nil {
+		t.Fatalf("Acquire after release = %v", err)
+	}
+	rel()
+	if acts := a.acts(); len(acts) != 1 || acts[0] != "small" {
+		t.Fatalf("activations = %v", acts)
+	}
+}
+
+// A hold that appears while requests wait behind an in-flight one turns them
+// away when the switch would run, instead of starting the backend.
+func TestHoldAppearingWhileQueuedRefusesTheSwitch(t *testing.T) {
+	a := &heldFake{fake: &fake{current: "large", up: true}}
+	g := newGroup(map[string]Lifecycle{"a": a}, 5*time.Second)
+	g.Detect(context.Background())
+
+	relLarge, _, err := g.Acquire(context.Background(), Key{"a", "large"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan error, 1)
+	go func() {
+		rel, _, err := g.Acquire(context.Background(), Key{"a", "small"})
+		if err == nil {
+			rel()
+		}
+		got <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for g.State().Waiting == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("request never queued")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	a.held.Store(true)
+	relLarge()
+	select {
+	case err := <-got:
+		if !errors.Is(err, ErrHeld) {
+			t.Fatalf("queued request = %v, want ErrHeld", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued request was never answered")
+	}
+	if acts := a.acts(); len(acts) != 0 {
+		t.Fatalf("activated a held backend: %v", acts)
+	}
+}
+
 func TestSwitchWaitsForInFlight(t *testing.T) {
 	a := &fake{current: "large", up: true}
 	g := newGroup(map[string]Lifecycle{"a": a}, 5*time.Second)

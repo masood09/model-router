@@ -6,6 +6,9 @@
 // head's variant and releases every waiter for it. While a switch is pending,
 // new requests for the current variant queue too, so a steady stream of them
 // cannot starve the waiting variant. In-flight requests are never cut off.
+//
+// A backend parked by a hold (see Holder) is never switched to: the waiters
+// for it fail with ErrHeld, and the group's state is left as it was.
 package scheduler
 
 import (
@@ -53,11 +56,19 @@ type Runner interface {
 	Running(ctx context.Context) (running, ok bool)
 }
 
+// Holder is implemented by lifecycles that another process can park. While
+// Held is true the scheduler does not activate, restart or wait for the
+// backend.
+type Holder interface {
+	Held() bool
+}
+
 // Errors returned by Acquire.
 var (
 	ErrQueueFull = errors.New("too many requests waiting for a model switch")
 	ErrTimeout   = errors.New("timed out waiting for the model to become active")
 	ErrSwitch    = errors.New("model switch failed")
+	ErrHeld      = errors.New("backend is held")
 )
 
 // Observer receives scheduler events, for metrics. Any field may be nil.
@@ -375,6 +386,15 @@ func (g *Group) switchTo(from, to Key) {
 
 	g.mu.Lock()
 	g.switching = false
+	if errors.Is(err, ErrHeld) {
+		// Nothing was touched, so the group's state stands; only the
+		// waiters for the held backend are turned away.
+		g.grantLocked(to, err)
+		g.log.Warn("switch refused: backend is held", "to", to.String())
+		g.kick()
+		g.mu.Unlock()
+		return
+	}
 	if err != nil {
 		g.active, g.ready = to, false
 		err = fmt.Errorf("%w: %s: %v", ErrSwitch, to, err)
@@ -393,6 +413,11 @@ func (g *Group) switchTo(from, to Key) {
 
 func (g *Group) doSwitch(ctx context.Context, from, to Key) error {
 	target := g.backends[to.Backend]
+	// Checked here, as well as when a request is admitted, because a hold can
+	// appear while requests are queued. A held backend is never started.
+	if h, ok := target.(Holder); ok && h.Held() {
+		return ErrHeld
+	}
 	if from == to {
 		// The same variant that merely looked down: re-check before restarting.
 		if target.Ready(ctx) {

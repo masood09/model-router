@@ -388,6 +388,65 @@ func TestModelsList(t *testing.T) {
 	}
 }
 
+func TestHeldBackendIsRefusedFast(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "held")
+	h := newHarness(t, "", func(o *Options) {
+		o.Backends["llm"].HoldFile = marker
+		o.Backends["llm"].HoldRetryAfter = 45 * time.Second
+	})
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, model := range []string{"big", "small"} {
+		start := time.Now()
+		resp := h.post(t, "/v1/chat/completions", `{"model":"`+model+`"}`)
+		if resp.StatusCode != 503 || resp.Header.Get("Retry-After") != "45" {
+			t.Fatalf("%s: status %d, Retry-After %q", model, resp.StatusCode, resp.Header.Get("Retry-After"))
+		}
+		var e apiError
+		_ = json.NewDecoder(resp.Body).Decode(&e)
+		if e.Error.Code != "backend_held" {
+			t.Fatalf("%s: error = %+v", model, e)
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Fatalf("%s: refusal took %s, want immediate", model, d)
+		}
+	}
+	if h.up.count() != 0 || len(h.life.acts()) != 0 {
+		t.Fatalf("held backend was used: %d upstream requests, activations %v", h.up.count(), h.life.acts())
+	}
+
+	resp, err := http.Get(h.srv.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Data []modelEntry `json:"data"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	for _, m := range out.Data {
+		if m.Status.Value != "held" {
+			t.Errorf("%s status = %q, want held", m.ID, m.Status.Value)
+		}
+	}
+
+	var b strings.Builder
+	_ = h.router.mReg.Write(&b)
+	if !strings.Contains(b.String(), `model_router_held_total{backend="llm"} 2`) {
+		t.Fatalf("held metric missing:\n%s", b.String())
+	}
+
+	// Released: the loaded model is served again.
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if resp := h.post(t, "/v1/chat/completions", `{"model":"big"}`); resp.StatusCode != 200 {
+		t.Fatalf("after release: status %d", resp.StatusCode)
+	}
+}
+
 func TestRouterEndpoints(t *testing.T) {
 	t.Setenv("MR_ADMIN", "admin-token-0123456789")
 	admin, _ := auth.Load("", "MR_ADMIN")

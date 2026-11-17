@@ -69,6 +69,7 @@ type Router struct {
 	mReg      *metrics.Registry
 	mRequests *metrics.Counter
 	mDuration *metrics.Summary
+	mHeld     *metrics.Counter
 }
 
 // New builds the router. It panics on wiring errors that validated
@@ -110,6 +111,7 @@ func New(o Options) *Router {
 	if r.mReg != nil {
 		r.mRequests = r.mReg.NewCounter("model_router_requests_total", "Requests handled, by catalog model and HTTP status.", "model", "code")
 		r.mDuration = r.mReg.NewSummary("model_router_request_duration_seconds", "Request duration including queueing, by catalog model.", "model")
+		r.mHeld = r.mReg.NewCounter("model_router_held_total", "Requests refused because their backend was held.", "backend")
 	}
 	return r
 }
@@ -249,6 +251,12 @@ func (r *Router) serveModel(w *recorder, req *http.Request) (label, target strin
 		label = rt.name
 	}
 	target = rt.key.String()
+	// Refused before it can queue: queueing would ask the scheduler to start
+	// a backend that another process has parked.
+	if rt.backend.Held() {
+		r.refuseHeld(w, rt.backend)
+		return label, target, 0
+	}
 	body.inject(rt.inject)
 	out, err := body.bytes()
 	if err != nil {
@@ -273,7 +281,7 @@ func (r *Router) serveModel(w *recorder, req *http.Request) (label, target strin
 			release, waited, err = rt.group.Acquire(req.Context(), rt.key)
 			queued += waited
 			if err != nil {
-				r.acquireError(w, req, err)
+				r.acquireError(w, req, rt.backend, err)
 				return label, target, queued
 			}
 		}
@@ -306,10 +314,13 @@ func isDialError(err error) bool {
 	return errors.As(err, &op) && op.Op == "dial"
 }
 
-func (r *Router) acquireError(w http.ResponseWriter, req *http.Request, err error) {
+func (r *Router) acquireError(w http.ResponseWriter, req *http.Request, b *backend.Backend, err error) {
 	switch {
 	case req.Context().Err() != nil:
 		// The client disconnected while waiting; nothing to send.
+	case errors.Is(err, scheduler.ErrHeld):
+		// The hold appeared while the request was queued.
+		r.refuseHeld(w, b)
 	case errors.Is(err, scheduler.ErrQueueFull):
 		writeError(w, http.StatusServiceUnavailable, "server_busy", "queue_full", "too many requests are waiting for a model switch", 10)
 	case errors.Is(err, scheduler.ErrTimeout):
@@ -320,6 +331,15 @@ func (r *Router) acquireError(w http.ResponseWriter, req *http.Request, err erro
 	default:
 		writeError(w, http.StatusServiceUnavailable, "server_error", "model_unavailable", "the requested model is not available", 30)
 	}
+}
+
+// refuseHeld answers a request whose backend is held.
+func (r *Router) refuseHeld(w http.ResponseWriter, b *backend.Backend) {
+	if r.mHeld != nil {
+		r.mHeld.Inc(b.Name)
+	}
+	writeError(w, http.StatusServiceUnavailable, "server_busy", "backend_held",
+		"the requested model is paused while its hardware is in use elsewhere", int(b.HoldRetryAfter.Seconds()))
 }
 
 // resolve maps a requested model name to a route according to the
@@ -378,7 +398,9 @@ func (r *Router) serveModels(w http.ResponseWriter) {
 	for _, name := range r.modelNames {
 		rt := r.routes[name]
 		status := "loaded"
-		if rt.group != nil {
+		if rt.backend.Held() {
+			status = "held"
+		} else if rt.group != nil {
 			st, ok := states[rt.group]
 			if !ok {
 				st = rt.group.State()

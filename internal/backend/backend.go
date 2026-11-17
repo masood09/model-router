@@ -41,6 +41,11 @@ type Backend struct {
 	// UpstreamToken, if non-empty, is sent as a bearer token upstream.
 	UpstreamToken string
 
+	// HoldFile parks the backend while it exists; empty means no hold.
+	// HoldRetryAfter is sent with each refusal.
+	HoldFile       string
+	HoldRetryAfter time.Duration
+
 	Driver Driver
 	probe  *Probe
 }
@@ -58,6 +63,8 @@ func New(name string, c config.Backend, client *http.Client) (*Backend, error) {
 		Upstream:             u,
 		PreserveHost:         c.PreserveHost,
 		ForwardAuthorization: c.ForwardAuthorization,
+		HoldFile:             c.Hold.File,
+		HoldRetryAfter:       c.Hold.RetryAfter.D(),
 		probe:                NewProbe(u, c.Readiness, client),
 	}
 	if c.UpstreamTokenFile != "" {
@@ -87,6 +94,19 @@ func (b *Backend) Ready(ctx context.Context) bool { return b.probe.Check(ctx) ==
 // WaitReady polls the readiness probe until it succeeds, the configured
 // readiness timeout passes, or ctx ends.
 func (b *Backend) WaitReady(ctx context.Context) error { return b.probe.Wait(ctx) }
+
+// Held reports whether the hold marker exists. It costs one stat, and nothing
+// when no hold is configured. Only a confirmed absence (ENOENT) releases the
+// hold: any other stat error, such as a permission problem, keeps the backend
+// held, because a controller that owns the resource must never be raced by
+// a model load.
+func (b *Backend) Held() bool {
+	if b.HoldFile == "" {
+		return false
+	}
+	_, err := os.Stat(b.HoldFile)
+	return !errors.Is(err, os.ErrNotExist)
+}
 
 func readToken(path string) (string, error) {
 	data, err := os.ReadFile(path) // #nosec G304 -- operator-configured path

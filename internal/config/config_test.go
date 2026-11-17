@@ -70,6 +70,20 @@ func TestParseValidAppliesDefaults(t *testing.T) {
 	if c.Limits.MaxBodyBytes != DefaultMaxBodyBytes {
 		t.Errorf("MaxBodyBytes = %d", c.Limits.MaxBodyBytes)
 	}
+	if b.Hold.File != "" || b.Hold.RetryAfter.D() != DefaultHoldRetryAfter {
+		t.Errorf("hold defaults = %+v", b.Hold)
+	}
+}
+
+func TestParseAcceptsHold(t *testing.T) {
+	s := strings.Replace(validJSON, `"readiness": {"path"`, `"hold": {"file": "/run/console/held", "retryAfter": "90s"}, "readiness": {"path"`, 1)
+	c, err := Parse([]byte(s))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if h := c.Backends["llm"].Hold; h.File != "/run/console/held" || h.RetryAfter.D() != 90*time.Second {
+		t.Fatalf("hold = %+v", h)
+	}
 }
 
 func TestParseRejects(t *testing.T) {
@@ -106,6 +120,18 @@ func TestParseRejects(t *testing.T) {
 		{"router prefix root", func(s string) string {
 			return strings.Replace(s, `"listen"`, `"routerPrefix": "/", "listen"`, 1)
 		}, "routerPrefix"},
+		{"relative hold file", func(s string) string {
+			return strings.Replace(s, `"readiness": {"path"`, `"hold": {"file": "run/held"}, "readiness": {"path"`, 1)
+		}, "hold.file"},
+		{"unclean hold file", func(s string) string {
+			return strings.Replace(s, `"readiness": {"path"`, `"hold": {"file": "/run/x/../held"}, "readiness": {"path"`, 1)
+		}, "hold.file"},
+		{"hold retryAfter too short", func(s string) string {
+			return strings.Replace(s, `"readiness": {"path"`, `"hold": {"file": "/run/held", "retryAfter": "500ms"}, "readiness": {"path"`, 1)
+		}, "hold.retryAfter"},
+		{"hold retryAfter too long", func(s string) string {
+			return strings.Replace(s, `"readiness": {"path"`, `"hold": {"file": "/run/held", "retryAfter": "2h"}, "readiness": {"path"`, 1)
+		}, "hold.retryAfter"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

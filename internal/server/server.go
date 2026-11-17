@@ -42,6 +42,7 @@ func (l lifecycle) Deactivate(ctx context.Context) error         { return l.b.Dr
 func (l lifecycle) WaitReady(ctx context.Context) error          { return l.b.WaitReady(ctx) }
 func (l lifecycle) Ready(ctx context.Context) bool               { return l.b.Ready(ctx) }
 func (l lifecycle) Current() (string, error)                     { return l.b.Driver.Current() }
+func (l lifecycle) Held() bool                                   { return l.b.Held() }
 
 // Running forwards to drivers that can report their process state, so the
 // scheduler waits for a backend that is still loading instead of

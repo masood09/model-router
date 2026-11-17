@@ -27,6 +27,7 @@ import (
 type env struct {
 	dir       string
 	selection string
+	hold      string
 	serving   string
 	upstream  *httptest.Server
 	url       string
@@ -39,6 +40,7 @@ func newEnv(t *testing.T, extra string) *env {
 	e := &env{dir: t.TempDir()}
 	e.selection = filepath.Join(e.dir, "selection")
 	e.serving = filepath.Join(e.dir, "serving")
+	e.hold = filepath.Join(e.dir, "held")
 	if err := os.WriteFile(e.serving, []byte("large\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +95,8 @@ esac
       "driver": {"kind": "systemd", "systemd": {
         "unit": "llm-backend.service", "selectionFile": %q, "defaultVariant": "large",
         "systemctl": %q, "actionTimeout": "10s"}},
-      "readiness": {"bodyContains": "loaded", "interval": "20ms", "timeout": "10s"}
+      "readiness": {"bodyContains": "loaded", "interval": "20ms", "timeout": "10s"},
+      "hold": {"file": %q, "retryAfter": "30s"}
     }
   },
   "models": {
@@ -101,7 +104,7 @@ esac
     "m-large-uncensored": {"backend": "llm", "variant": "large", "inject": {"projection": true}},
     "m-small": {"backend": "llm", "variant": "small", "inject": {"projection": false}}
   }
-}`, extra, e.upstream.URL, e.selection, systemctl)
+}`, extra, e.upstream.URL, e.selection, systemctl, e.hold)
 	cfg, err := config.Parse([]byte(cfgJSON))
 	if err != nil {
 		t.Fatalf("config: %v", err)
@@ -298,6 +301,52 @@ func TestNewRejectsBadTokenSources(t *testing.T) {
 	}
 	if _, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil {
 		t.Fatal("missing token file accepted")
+	}
+}
+
+// A held backend is never restarted, even for a request that would switch it:
+// the selection file and the served variant stay untouched until the marker
+// goes, and then the switch happens as usual.
+func TestEndToEndHoldBlocksSwitching(t *testing.T) {
+	e := newEnv(t, "")
+	if err := os.WriteFile(e.hold, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(e.url+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"m-small"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 503 || resp.Header.Get("Retry-After") != "30" || !strings.Contains(string(body), "backend_held") {
+		t.Fatalf("held: status %d, Retry-After %q, body %s", resp.StatusCode, resp.Header.Get("Retry-After"), body)
+	}
+	if _, err := os.Stat(e.selection); !os.IsNotExist(err) {
+		t.Fatal("a held backend's selection file was written")
+	}
+	if got, _ := os.ReadFile(e.serving); strings.TrimSpace(string(got)) != "large" {
+		t.Fatalf("a held backend was restarted: serving %q", got)
+	}
+
+	if err := os.Remove(e.hold); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.chat(t, "m-small")["variant"]; got != "small" {
+		t.Fatalf("after release variant %v", got)
+	}
+}
+
+func TestLifecycleForwardsHeld(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "held")
+	l := lifecycle{&backend.Backend{Driver: backend.Static{}, HoldFile: marker}}
+	if l.Held() {
+		t.Fatal("held without a marker")
+	}
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !l.Held() {
+		t.Fatal("marker not forwarded")
 	}
 }
 

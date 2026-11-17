@@ -134,6 +134,21 @@ type Backend struct {
 
 	Driver    Driver    `json:"driver"`
 	Readiness Readiness `json:"readiness"`
+
+	// Hold lets another process park the backend. See Hold.
+	Hold Hold `json:"hold"`
+}
+
+// Hold lets another process park a backend, for example a controller that
+// hands the backend's GPU to a different workload. While File exists, every
+// request for the backend is refused with 503 and Retry-After, and the
+// scheduler never switches to it, so the router cannot restart the backend
+// behind that controller's back. The router only reads the file.
+type Hold struct {
+	// File is the marker path. Empty disables the hold.
+	File string `json:"file"`
+	// RetryAfter is sent with each refusal.
+	RetryAfter Duration `json:"retryAfter"`
 }
 
 // Driver selects and configures how a backend is started, stopped and switched.
@@ -217,6 +232,7 @@ var (
 	DefaultReadyInterval             = 2 * time.Second
 	DefaultReadyTimeout              = 10 * time.Minute
 	DefaultReadyRequestTimeout       = 5 * time.Second
+	DefaultHoldRetryAfter            = 60 * time.Second
 )
 
 // Load reads, parses and validates the configuration file at path.
@@ -313,6 +329,7 @@ func (c *Config) applyDefaults() {
 		setDur(&r.Interval, DefaultReadyInterval)
 		setDur(&r.Timeout, DefaultReadyTimeout)
 		setDur(&r.RequestTimeout, DefaultReadyRequestTimeout)
+		setDur(&b.Hold.RetryAfter, DefaultHoldRetryAfter)
 		if s := b.Driver.Systemd; s != nil {
 			if s.Systemctl == "" {
 				s.Systemctl = "systemctl"
@@ -454,6 +471,12 @@ func (c *Config) validateBackend(name string, b Backend) []error {
 	}
 	if b.UpstreamTokenFile != "" && !filepath.IsAbs(b.UpstreamTokenFile) {
 		add("upstreamTokenFile must be an absolute path")
+	}
+	if b.Hold.File != "" && (!filepath.IsAbs(b.Hold.File) || filepath.Clean(b.Hold.File) != b.Hold.File) {
+		add("hold.file %q must be a clean absolute path", b.Hold.File)
+	}
+	if ra := b.Hold.RetryAfter.D(); ra < time.Second || ra > time.Hour {
+		add("hold.retryAfter must be between 1s and 1h")
 	}
 
 	r := b.Readiness

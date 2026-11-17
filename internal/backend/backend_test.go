@@ -148,6 +148,60 @@ func TestNewStaticBackend(t *testing.T) {
 	}
 }
 
+func TestHeld(t *testing.T) {
+	if (&Backend{}).Held() {
+		t.Fatal("a backend with no hold reports held")
+	}
+	marker := filepath.Join(t.TempDir(), "held")
+	b, err := New("llm", config.Backend{
+		Upstream:  "http://127.0.0.1:1",
+		Driver:    config.Driver{Kind: config.DriverStatic},
+		Readiness: readiness(time.Second),
+		Hold:      config.Hold{File: marker, RetryAfter: config.Duration(45 * time.Second)},
+	}, NewProbeClient(http.DefaultTransport))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if b.HoldRetryAfter != 45*time.Second {
+		t.Fatalf("HoldRetryAfter = %s", b.HoldRetryAfter)
+	}
+	if b.Held() {
+		t.Fatal("held before the marker exists")
+	}
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !b.Held() {
+		t.Fatal("not held while the marker exists")
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if b.Held() {
+		t.Fatal("still held after the marker was removed")
+	}
+}
+
+// A marker the router cannot stat must keep the backend held: releasing on an
+// unreadable path would let the router start a backend its owner has parked.
+func TestHeldFailsClosed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	dir := filepath.Join(t.TempDir(), "locked")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b := &Backend{HoldFile: filepath.Join(dir, "held")}
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if !b.Held() {
+		t.Fatal("an unreadable marker released the hold")
+	}
+}
+
 func TestNewRejectsEmptyToken(t *testing.T) {
 	tok := filepath.Join(t.TempDir(), "tok")
 	if err := os.WriteFile(tok, []byte("  \n"), 0o600); err != nil {

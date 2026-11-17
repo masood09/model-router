@@ -56,6 +56,24 @@ between each other.
   it adopts that backend's selected variant as not ready yet, so the first
   request waits rather than restarting it.
 
+**Holds: lending a backend's hardware to something else.** A backend can name
+a `hold.file`. While that file exists, the backend is *held*:
+- Every request for it gets an immediate `503 backend_held` with
+  `Retry-After: hold.retryAfter`. Nothing is queued.
+- The scheduler never activates, restarts or waits for it. Requests that were
+  already queued are turned away the same way, if the hold appears before
+  their switch runs.
+- `/v1/models` reports its models as `held`.
+
+The router only reads the file. Whatever creates and removes it, such as a
+controller handing the GPU to a game session or a maintenance window, owns the
+backend's lifecycle meanwhile, including stopping it. Requests already running
+when the hold appears are not cut off by the router.
+
+Only a confirmed absence releases a hold: if the marker can't be checked (for
+example, the router can't search its directory), the backend stays held. Make
+the directory searchable by the router's user.
+
 ## Quick start
 
 ### Nix (flake)
@@ -150,6 +168,8 @@ A zero value (`"0s"`, or `0` for numbers) means "use the default", not "none".
 | `preserveHost` | Send the client's `Host` upstream. Default: the upstream's own host, which servers with DNS-rebinding checks require. |
 | `forwardAuthorization` | Forward the client's `Authorization` and `x-api-key`. Default: stripped. |
 | `upstreamTokenFile` | Bearer token to send upstream. |
+| `hold.file` | Clean absolute path of a marker that holds the backend while it exists (see Holds above). Unset means no hold. |
+| `hold.retryAfter` | `Retry-After` sent with each refusal while held: `60s`, between `1s` and `1h`. |
 | `readiness.path` | Probe path (default `/v1/models`). |
 | `readiness.expectStatus` / `bodyContains` | Ready when the status matches and the body contains the text. |
 | `readiness.interval` / `timeout` / `requestTimeout` | `2s` / `10m` / `5s`. |
@@ -181,7 +201,7 @@ never be read differently from the one the router routed on.
 | Path | Description |
 |---|---|
 | `POST` *model paths* | Routed by `model`, with switching as above. |
-| `GET /v1/models` | The catalog, with `status.value` of `loaded`, `loading` or `unloaded` for each model, from cached state. |
+| `GET /v1/models` | The catalog, with `status.value` of `loaded`, `loading`, `unloaded` or `held` for each model, from cached state. |
 | *anything else* | Passthrough to the default model's backend (or `404` with `passthrough: off`). |
 | `GET /_router/healthz` | Liveness. |
 | `GET /_router/readyz` | `503` while draining for shutdown. |
@@ -200,6 +220,7 @@ Metrics:
 - `model_router_switch_duration_seconds{group}`
 - `model_router_inflight_requests{group}`, `model_router_waiting_requests{group}`, `model_router_group_ready{group}`
 - `model_router_active_model{group,active}`
+- `model_router_held_total{backend}`: requests refused because their backend was held
 
 Model labels are catalog names, and every unknown name is reported as
 `unknown`, so cardinality stays bounded. The request counter and duration
