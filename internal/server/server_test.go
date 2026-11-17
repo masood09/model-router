@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/masood09/model-router/internal/backend"
 	"github.com/masood09/model-router/internal/config"
 )
 
@@ -297,6 +298,28 @@ func TestNewRejectsBadTokenSources(t *testing.T) {
 	}
 	if _, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil {
 		t.Fatal("missing token file accepted")
+	}
+}
+
+// runningDriver is a backend.Driver that reports a process state.
+type runningDriver struct {
+	backend.Static
+	running, known bool
+}
+
+func (d runningDriver) Running(context.Context) (bool, bool) { return d.running, d.known }
+
+func TestLifecycleForwardsRunning(t *testing.T) {
+	for _, d := range []runningDriver{{running: true, known: true}, {running: false, known: true}, {known: false}} {
+		running, known := lifecycle{&backend.Backend{Driver: d}}.Running(context.Background())
+		if running != d.running || known != d.known {
+			t.Errorf("Running = %v, %v; want %v, %v", running, known, d.running, d.known)
+		}
+	}
+	// Drivers that cannot tell report "unknown", so the scheduler keeps its
+	// old behaviour for them.
+	if running, known := (lifecycle{&backend.Backend{Driver: backend.Static{}}}).Running(context.Background()); running || known {
+		t.Fatalf("static driver: Running = %v, %v; want false, false", running, known)
 	}
 }
 

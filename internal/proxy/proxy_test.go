@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -495,6 +496,66 @@ func TestRefusedConnectionIsRetriedAfterWaiting(t *testing.T) {
 	}
 	if acts := h.life.acts(); len(acts) != 0 {
 		t.Fatalf("a backend that was up got restarted: %v", acts)
+	}
+}
+
+// loadingLifecycle is a backend whose process is up (scheduler.Runner) but
+// whose model only becomes ready after a delay, like one a deploy just
+// restarted.
+type loadingLifecycle struct {
+	*lifecycle
+	readyAt atomic.Int64 // unix nanoseconds
+}
+
+func (l *loadingLifecycle) Ready(context.Context) bool {
+	return time.Now().UnixNano() > l.readyAt.Load()
+}
+func (l *loadingLifecycle) WaitReady(ctx context.Context) error {
+	for !l.Ready(ctx) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	return nil
+}
+func (l *loadingLifecycle) Running(context.Context) (bool, bool) { return true, true }
+
+func TestRefusedConnectionToLoadingBackendWaitsWithoutRestart(t *testing.T) {
+	up := newUpstream(t)
+	cfg, err := config.Parse([]byte(baseConfig(up.srv.URL, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(up.srv.URL)
+	life := &loadingLifecycle{lifecycle: &lifecycle{current: "large", up: true}}
+	g := scheduler.New(scheduler.Options{Name: "gpu0", MaxWaiters: 10, MaxWait: 2 * time.Second, Refresh: time.Hour,
+		Backends: map[string]scheduler.Lifecycle{"llm": life}, Logger: quiet()})
+	g.Detect(context.Background()) // ready now: adopted as active and ready
+	tr := &refuseOnce{next: http.DefaultTransport}
+	r := New(Options{Config: cfg, Backends: map[string]*backend.Backend{"llm": {Name: "llm", Group: "gpu0", Upstream: u}},
+		Groups: map[string]*scheduler.Group{"gpu0": g}, Transport: tr, Logger: quiet()})
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	// The backend restarts behind the router's back: it refuses one
+	// connection and then needs a moment to load.
+	life.readyAt.Store(time.Now().Add(150 * time.Millisecond).UnixNano())
+	start := time.Now()
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"big"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if time.Since(start) < 100*time.Millisecond {
+		t.Fatal("retried before the backend finished loading")
+	}
+	if acts := life.acts(); len(acts) != 0 {
+		t.Fatalf("restarted a backend that was still loading: %v", acts)
 	}
 }
 
