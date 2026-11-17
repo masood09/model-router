@@ -105,12 +105,13 @@ model-router -config config.json                 # serve
 
 A single JSON file (see [`examples/config.example.json`](examples/config.example.json)).
 Unknown fields are rejected. Durations are Go duration strings (`"30s"`, `"15m"`).
+A zero value (`"0s"`, or `0` for numbers) means "use the default", not "none".
 
 | Field | Default | Meaning |
 |---|---|---|
 | `listen` | `127.0.0.1:8080` | Listen address. |
-| `defaultModel` | *(required)* | Catalog name used for requests without a model, the `default` policy and passthrough. |
-| `unknownModel` | `loaded` | Unknown names: `loaded` (serve with what is active, never switch), `default`, or `reject` (404). |
+| `defaultModel` | *(required)* | Catalog name used by the `default` policy, as the fallback for `loaded` while nothing is active, and for passthrough. |
+| `unknownModel` | `loaded` | Names not in the catalog, including a missing or non-string `model`: `loaded` (serve with what is active, never switch, inject nothing), `default` (switch to `defaultModel`, with its injections), or `reject` (404). |
 | `passthrough` | `default` | Requests to other paths: `default` (proxy to the default model's backend, no scheduling) or `off` (404). |
 | `modelPaths` | chat, completions, responses, messages | POST paths whose body carries `model`. |
 | `routerPrefix` | `/_router/` | Prefix of the router's own endpoints. |
@@ -154,6 +155,13 @@ group.
 `-`; at most 64 characters), and an optional `inject` object of top-level
 fields added when the client didn't set them. `model` can't be injected.
 
+Under the `loaded` policy an unknown name gets no injections, even when it
+lands on a variant that catalog entries inject for: several names can share
+a variant with different injections (that is the point of them), so there is
+no single right set to apply. Request bodies must be a JSON object without
+duplicate top-level keys (`400 duplicate_key`), so the forwarded body can
+never be read differently from the one the router routed on.
+
 ## Endpoints
 
 | Path | Description |
@@ -180,7 +188,9 @@ Metrics:
 - `model_router_active_model{group,active}`
 
 Model labels are catalog names, and every unknown name is reported as
-`unknown`, so cardinality stays bounded.
+`unknown`, so cardinality stays bounded. The request counter and duration
+cover model-path requests only; `/v1/models`, passthrough and the router's
+own endpoints are logged but not counted.
 
 Logs are JSON on stderr, with one line per request: id, method, path, model,
 target, status, queued and total milliseconds. Bodies, tokens and
