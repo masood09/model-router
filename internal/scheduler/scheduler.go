@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 )
@@ -25,10 +26,14 @@ type Key struct {
 
 // String renders the key for logs and metrics.
 func (k Key) String() string {
-	if k.Backend == "" {
+	switch {
+	case k.Backend == "":
 		return "none"
+	case k.Variant == "":
+		return k.Backend
+	default:
+		return k.Backend + "/" + k.Variant
 	}
-	return k.Backend + "/" + k.Variant
 }
 
 // Lifecycle is what the scheduler needs from a backend.
@@ -62,6 +67,9 @@ type Options struct {
 	Backends   map[string]Lifecycle
 	Observer   Observer
 	Logger     *slog.Logger
+	// Context bounds switches: cancelling it aborts one in progress (its
+	// waiters fail). Defaults to context.Background().
+	Context context.Context
 }
 
 type ticket struct {
@@ -76,8 +84,10 @@ type Group struct {
 	maxWait    time.Duration
 	refresh    time.Duration
 	backends   map[string]Lifecycle
+	names      []string // backend names, sorted, for deterministic detection
 	obs        Observer
 	log        *slog.Logger
+	ctx        context.Context
 
 	mu        sync.Mutex
 	active    Key
@@ -94,14 +104,25 @@ func New(o Options) *Group {
 	if log == nil {
 		log = slog.Default()
 	}
+	ctx := o.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	names := make([]string, 0, len(o.Backends))
+	for n := range o.Backends {
+		names = append(names, n)
+	}
+	sort.Strings(names)
 	return &Group{
 		name:       o.Name,
 		maxWaiters: o.MaxWaiters,
 		maxWait:    o.MaxWait,
 		refresh:    o.Refresh,
 		backends:   o.Backends,
+		names:      names,
 		obs:        o.Observer,
 		log:        log.With("group", o.Name),
+		ctx:        ctx,
 	}
 }
 
@@ -122,10 +143,12 @@ func (g *Group) State() State {
 }
 
 // Detect works out which backend variant is currently serving by probing
-// each backend. If none is ready, the group starts with nothing active and
-// the first request triggers a switch.
+// each backend, in name order, and adopting the first that is ready. If none
+// is ready, the group starts with nothing active and the first request
+// triggers a switch.
 func (g *Group) Detect(ctx context.Context) {
-	for name, b := range g.backends {
+	for _, name := range g.names {
+		b := g.backends[name]
 		if !b.Ready(ctx) {
 			continue
 		}
@@ -308,7 +331,9 @@ func (g *Group) grantLocked(key Key, err error) {
 }
 
 func (g *Group) switchTo(from, to Key) {
-	ctx := context.Background() // bounded by the drivers' and probe's own timeouts
+	// Bounded by the drivers' and probe's own timeouts, and cancelled when
+	// the group's context ends (shutdown).
+	ctx := g.ctx
 	start := time.Now()
 	g.log.Info("switching model", "from", from.String(), "to", to.String())
 

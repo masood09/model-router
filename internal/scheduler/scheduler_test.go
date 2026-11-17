@@ -389,7 +389,45 @@ func TestConcurrentMixedLoad(t *testing.T) {
 }
 
 func TestKeyString(t *testing.T) {
-	if (Key{}).String() != "none" || (Key{"a", "b"}).String() != "a/b" {
+	if (Key{}).String() != "none" || (Key{"a", "b"}).String() != "a/b" || (Key{"a", ""}).String() != "a" {
 		t.Fatal("Key.String")
+	}
+}
+
+func TestDetectIsDeterministic(t *testing.T) {
+	for range 20 {
+		backends := map[string]Lifecycle{
+			"zeta":  &fake{current: "z", up: true},
+			"alpha": &fake{current: "a", up: true},
+			"mid":   &fake{current: "m", up: true},
+		}
+		g := newGroup(backends, time.Second)
+		g.Detect(context.Background())
+		if got := g.State().Active; got != (Key{"alpha", "a"}) {
+			t.Fatalf("detected %v, want alpha/a (first by name)", got)
+		}
+	}
+}
+
+func TestSwitchCancelledWithGroupContext(t *testing.T) {
+	a := &fake{current: "large", up: true, gate: make(chan struct{})} // Activate blocks until ctx ends
+	ctx, cancel := context.WithCancel(context.Background())
+	g := New(Options{Name: "g", MaxWaiters: 4, MaxWait: 10 * time.Second, Refresh: time.Hour,
+		Backends: map[string]Lifecycle{"a": a}, Logger: quiet(), Context: ctx})
+	g.Detect(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, _, err := g.Acquire(context.Background(), Key{"a", "small"})
+		errc <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, ErrSwitch) {
+			t.Fatalf("err = %v, want ErrSwitch", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("switch was not cancelled with the group context")
 	}
 }
