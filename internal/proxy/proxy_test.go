@@ -410,10 +410,20 @@ func TestRouterEndpoints(t *testing.T) {
 func TestMetricsCountRequests(t *testing.T) {
 	h := newHarness(t, "")
 	h.post(t, "/v1/chat/completions", `{"model":"big"}`)
-	var b strings.Builder
-	_ = h.router.mReg.Write(&b)
-	if !strings.Contains(b.String(), `model_router_requests_total{model="big",code="200"} 1`) {
-		t.Fatalf("metrics:\n%s", b.String())
+	// The counter is recorded when the handler returns, which can be just
+	// after the client has read the response, so poll briefly.
+	want := `model_router_requests_total{model="big",code="200"} 1`
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var b strings.Builder
+		_ = h.router.mReg.Write(&b)
+		if strings.Contains(b.String(), want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("metrics never showed %q:\n%s", want, b.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

@@ -219,16 +219,35 @@ func TestEndToEndMetricsAndState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	for _, want := range []string{
+	wants := []string{
 		`model_router_switches_total{group="gpu0",result="ok"} 1`,
 		`model_router_requests_total{model="m-small",code="200"} 1`,
 		`model_router_active_model{group="gpu0",active="llm/small"} 1`,
-	} {
-		if !strings.Contains(string(body), want) {
-			t.Errorf("metrics missing %q", want)
+	}
+	// Request metrics are recorded as the handler returns, which can trail
+	// the client reading the response, so poll briefly.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp, err := http.Get(e.url + "/_router/metrics")
+		if err != nil {
+			t.Fatal(err)
 		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		var missing []string
+		for _, w := range wants {
+			if !strings.Contains(string(body), w) {
+				missing = append(missing, w)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("metrics missing %q", missing)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
