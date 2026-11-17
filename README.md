@@ -42,6 +42,20 @@ In-flight requests are never interrupted. Model names that share a variant
 (for example `local-large` and `local-large-variant-b`) never cause a switch
 between each other.
 
+**Backends that restart on their own** (a deploy, an operator, a crash):
+- **A dropped connection:** if a request finds its backend refusing
+  connections, nothing was sent. The router marks the backend not ready, waits
+  for it like any queued request and retries once. Any other upstream failure
+  returns `502` at once.
+- **A variant that looks down:** when it's the one already selected, the
+  router asks the driver whether the process is up or starting. The `systemd`
+  driver uses `systemctl is-active`. If it is up or starting, the router waits
+  for readiness instead of restarting it. Only a stopped or failed backend is
+  restarted.
+- **The router's own start:** if it starts while a backend is still loading,
+  it adopts that backend's selected variant as not ready yet, so the first
+  request waits rather than restarting it.
+
 ## Quick start
 
 ### Nix (flake)
