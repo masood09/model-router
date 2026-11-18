@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommits",
+    "schedule:weekly"
+  ],
+  "labels": ["dependencies"],
+  "nix": {
+    "enabled": true
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "description": "Refresh flake.lock (the nixpkgs pin) weekly. Only the nix manager has a lock file here: the Go module has no third-party dependencies."
+  },
+  "packageRules": [
+    {
+      "description": "Keep the go directive as the minimum language version; only the toolchain line tracks new releases.",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["golang"],
+      "enabled": false
+    },
+    {
+      "description": "Move the go.mod toolchain (CI and release binaries) and the Docker build image together so they never drift apart. flake.nix names its Go version (buildGo127Module, go_1_27) and needs a manual edit for a new minor release.",
+      "matchManagers": ["gomod", "dockerfile"],
+      "matchPackageNames": ["go", "docker.io/library/golang"],
+      "groupName": "go toolchain"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    }
+  ]
+}
