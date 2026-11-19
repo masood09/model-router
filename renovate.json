@@ -15,6 +15,17 @@
     "enabled": true,
     "description": "Refresh flake.lock (the nixpkgs pin) weekly. Only the nix manager has a lock file here: the Go module has no third-party dependencies."
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Go tools run in workflows as `go run <module>/cmd/<tool>@<version>` (staticcheck, govulncheck). Versions must be module versions (v0.8.2, not 2026.2.2).",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "go run (?<depName>[^@\\s]+?)/cmd/[^@\\s]+@(?<currentValue>v[0-9][^\\s]*)"
+      ],
+      "datasourceTemplate": "go"
+    }
+  ],
   "packageRules": [
     {
       "description": "Keep the go directive as the minimum language version; only the toolchain line tracks new releases.",
@@ -23,9 +34,14 @@
       "enabled": false
     },
     {
-      "description": "Move the go.mod toolchain (CI and release binaries) and the Docker build image together so they never drift apart. flake.nix names its Go version (buildGo127Module, go_1_27) and needs a manual edit for a new minor release.",
-      "matchManagers": ["gomod", "dockerfile"],
-      "matchPackageNames": ["go", "docker.io/library/golang"],
+      "description": "Move the go.mod toolchain (CI and release binaries), the Docker build image and the CI Go tools together so they never drift apart; a new Go release often needs a new staticcheck. flake.nix names its Go version (buildGo127Module, go_1_27) and needs a manual edit for a new minor release.",
+      "matchManagers": ["gomod", "dockerfile", "custom.regex"],
+      "matchPackageNames": [
+        "go",
+        "docker.io/library/golang",
+        "honnef.co/go/tools",
+        "golang.org/x/vuln"
+      ],
       "groupName": "go toolchain"
     },
     {
