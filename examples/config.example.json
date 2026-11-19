@@ -34,7 +34,8 @@
         "path": "/v1/models",
         "bodyContains": "\"loaded\"",
         "interval": "2s",
-        "timeout": "15m"
+        "timeout": "15m",
+        "startupGrace": "5m"
       }
     },
     "container-llm": {

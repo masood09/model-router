@@ -538,6 +538,69 @@ func TestDetectAdoptsBackendStillStarting(t *testing.T) {
 	}
 }
 
+// stuck is up (Running) but never becomes ready on its own, like an inference
+// server whose engine has stopped and that only reloads it when a request
+// arrives. Only a restart (Activate) brings it back. It may also be held.
+type stuck struct {
+	*starting
+	grace time.Duration
+	held  atomic.Bool
+}
+
+func newStuck(grace time.Duration) *stuck {
+	s := &stuck{starting: newStarting(&fake{current: "large", up: true}, true), grace: grace}
+	s.readyAt.Store(time.Now().Add(time.Hour).UnixNano())
+	return s
+}
+
+func (s *stuck) StartupGrace() time.Duration { return s.grace }
+func (s *stuck) Held() bool                  { return s.held.Load() }
+func (s *stuck) Activate(ctx context.Context, v string) error {
+	if err := s.fake.Activate(ctx, v); err != nil {
+		return err
+	}
+	s.readyAt.Store(time.Now().UnixNano()) // the restart reloads the engine
+	return nil
+}
+
+func TestUpButNeverReadyIsRestartedAfterStartupGrace(t *testing.T) {
+	s := newStuck(100 * time.Millisecond)
+	g := newGroup(map[string]Lifecycle{"a": s}, 5*time.Second)
+	g.Detect(context.Background()) // adopted as starting: active, not ready
+	start := time.Now()
+	rel, _, err := g.Acquire(context.Background(), Key{"a", "large"})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	rel()
+	if d := time.Since(start); d < 100*time.Millisecond {
+		t.Fatalf("restarted after %s, before the startup grace", d)
+	}
+	if acts := s.acts(); len(acts) != 1 || acts[0] != "large" {
+		t.Fatalf("activations = %v, want one restart of large", acts)
+	}
+	if st := g.State(); !st.Ready || st.Switching {
+		t.Fatalf("state = %+v, want ready", st)
+	}
+}
+
+func TestHoldDuringStartupGracePreventsRestart(t *testing.T) {
+	s := newStuck(100 * time.Millisecond)
+	g := newGroup(map[string]Lifecycle{"a": s}, 5*time.Second)
+	g.Detect(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		s.held.Store(true) // another process takes the hardware meanwhile
+	}()
+	_, _, err := g.Acquire(context.Background(), Key{"a", "large"})
+	if !errors.Is(err, ErrHeld) {
+		t.Fatalf("err = %v, want ErrHeld", err)
+	}
+	if acts := s.acts(); len(acts) != 0 {
+		t.Fatalf("restarted a held backend: %v", acts)
+	}
+}
+
 func TestSameVariantStoppedIsRestarted(t *testing.T) {
 	f := &fake{current: "large", up: true}
 	st := newStarting(f, true)

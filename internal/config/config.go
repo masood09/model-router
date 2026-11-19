@@ -198,6 +198,9 @@ type Readiness struct {
 	Interval Duration `json:"interval"`
 	// Timeout is how long to wait for readiness after an activation.
 	Timeout Duration `json:"timeout"`
+	// StartupGrace is how long a backend whose process is up but not ready
+	// is waited for before it is restarted. Defaults to Timeout.
+	StartupGrace Duration `json:"startupGrace"`
 	// RequestTimeout bounds each probe request.
 	RequestTimeout Duration `json:"requestTimeout"`
 }
@@ -328,6 +331,8 @@ func (c *Config) applyDefaults() {
 		}
 		setDur(&r.Interval, DefaultReadyInterval)
 		setDur(&r.Timeout, DefaultReadyTimeout)
+		// Never restarts a backend sooner than a plain wait would give up.
+		setDur(&r.StartupGrace, r.Timeout.D())
 		setDur(&r.RequestTimeout, DefaultReadyRequestTimeout)
 		setDur(&b.Hold.RetryAfter, DefaultHoldRetryAfter)
 		if s := b.Driver.Systemd; s != nil {
@@ -488,6 +493,9 @@ func (c *Config) validateBackend(name string, b Backend) []error {
 	}
 	if r.Interval <= 0 || r.Timeout <= 0 || r.RequestTimeout <= 0 {
 		add("readiness interval, timeout and requestTimeout must be positive")
+	}
+	if r.StartupGrace <= 0 || r.StartupGrace > r.Timeout {
+		add("readiness.startupGrace must be positive and at most readiness.timeout")
 	}
 
 	var actionTimeout Duration

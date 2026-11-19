@@ -46,6 +46,10 @@ type Backend struct {
 	HoldFile       string
 	HoldRetryAfter time.Duration
 
+	// StartupGrace bounds the wait for a backend that is up but not ready
+	// before the scheduler restarts it.
+	StartupGrace time.Duration
+
 	Driver Driver
 	probe  *Probe
 }
@@ -65,6 +69,7 @@ func New(name string, c config.Backend, client *http.Client) (*Backend, error) {
 		ForwardAuthorization: c.ForwardAuthorization,
 		HoldFile:             c.Hold.File,
 		HoldRetryAfter:       c.Hold.RetryAfter.D(),
+		StartupGrace:         c.Readiness.StartupGrace.D(),
 		probe:                NewProbe(u, c.Readiness, client),
 	}
 	if c.UpstreamTokenFile != "" {

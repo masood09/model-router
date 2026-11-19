@@ -50,8 +50,10 @@ between each other.
 - **A variant that looks down:** when it's the one already selected, the
   router asks the driver whether the process is up or starting. The `systemd`
   driver uses `systemctl is-active`. If it is up or starting, the router waits
-  for readiness instead of restarting it. Only a stopped or failed backend is
-  restarted.
+  for readiness instead of restarting it, for at most `readiness.startupGrace`.
+  If it is still not ready by then, it is up but stuck (for example an engine
+  that stopped and only reloads when a request reaches it), so the router
+  restarts it. A stopped or failed backend is restarted at once.
 - **The router's own start:** if it starts while a backend is still loading,
   it adopts that backend's selected variant as not ready yet, so the first
   request waits rather than restarting it.
@@ -173,6 +175,7 @@ A zero value (`"0s"`, or `0` for numbers) means "use the default", not "none".
 | `readiness.path` | Probe path (default `/v1/models`). |
 | `readiness.expectStatus` / `bodyContains` | Ready when the status matches and the body contains the text. |
 | `readiness.interval` / `timeout` / `requestTimeout` | `2s` / `10m` / `5s`. |
+| `readiness.startupGrace` | How long a backend that is up but not ready is waited for before it is restarted. Default: `readiness.timeout`, and at most that. |
 | `driver.kind` | `systemd`, `command` or `static`. |
 | `driver.systemd.unit` | Unit to restart/stop. |
 | `driver.systemd.selectionFile` | Absolute path. The variant is written here (atomically, `0644`) before each restart, for the unit to read at start. |

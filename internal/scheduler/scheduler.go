@@ -56,6 +56,15 @@ type Runner interface {
 	Running(ctx context.Context) (running, ok bool)
 }
 
+// StartupGracer is implemented by Runners that bound how long a backend that
+// is up but not ready is waited for before it is restarted. A process can be
+// up yet never become ready on its own, such as a server whose engine has
+// stopped and that only reloads it when a request reaches it; the router
+// sends none while it waits. Without it the wait lasts as long as WaitReady.
+type StartupGracer interface {
+	StartupGrace() time.Duration
+}
+
 // Holder is implemented by lifecycles that another process can park. While
 // Held is true the scheduler does not activate, restart or wait for the
 // backend.
@@ -424,11 +433,19 @@ func (g *Group) doSwitch(ctx context.Context, from, to Key) error {
 			return nil
 		}
 		// Still starting or loading (e.g. right after a deploy restarted it):
-		// wait for it instead of throwing the load away with a restart.
+		// wait for it instead of throwing the load away with a restart. If it
+		// is still not ready when the wait ends, it is up but stuck, so it is
+		// restarted below rather than failing the switch, which would leave
+		// every later request waiting for it the same way.
 		if r, ok := target.(Runner); ok {
 			if running, known := r.Running(ctx); known && running {
-				g.log.Info("backend is starting; waiting for it instead of restarting", "active", to.String())
-				return target.WaitReady(ctx)
+				if err := g.awaitStarting(ctx, target, to); err == nil || ctx.Err() != nil {
+					return err
+				}
+				// A hold can appear during a long wait: never restart into it.
+				if h, ok := target.(Holder); ok && h.Held() {
+					return ErrHeld
+				}
 			}
 		}
 	}
@@ -441,4 +458,24 @@ func (g *Group) doSwitch(ctx context.Context, from, to Key) error {
 		return fmt.Errorf("activate: %w", err)
 	}
 	return target.WaitReady(ctx)
+}
+
+// awaitStarting waits for a backend whose process is up to become ready,
+// for at most its startup grace when it has one.
+func (g *Group) awaitStarting(ctx context.Context, target Lifecycle, key Key) error {
+	wctx := ctx
+	attrs := []any{"active", key.String()}
+	if s, ok := target.(StartupGracer); ok && s.StartupGrace() > 0 {
+		var cancel context.CancelFunc
+		wctx, cancel = context.WithTimeout(ctx, s.StartupGrace())
+		defer cancel()
+		attrs = append(attrs, "grace", s.StartupGrace().String())
+	}
+	g.log.Info("backend is starting; waiting for it instead of restarting", attrs...)
+	err := target.WaitReady(wctx)
+	if err != nil && ctx.Err() == nil {
+		g.log.Warn("backend is up but did not become ready; restarting it",
+			append(attrs, "error", err.Error())...)
+	}
+	return err
 }

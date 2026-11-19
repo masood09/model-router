@@ -29,29 +29,46 @@ type env struct {
 	selection string
 	hold      string
 	serving   string
-	upstream  *httptest.Server
-	url       string
-	cancel    context.CancelFunc
-	done      chan error
+	// active, while it exists, makes `systemctl is-active` report the unit
+	// up. engineDown, while it exists, makes the upstream list no loaded
+	// model, like a server whose engine stopped; a restart removes it.
+	active     string
+	engineDown string
+	upstream   *httptest.Server
+	url        string
+	cancel     context.CancelFunc
+	done       chan error
 }
 
 func newEnv(t *testing.T, extra string) *env {
+	t.Helper()
+	return newEnvWith(t, extra, nil)
+}
+
+// newEnvWith is newEnv with a hook that runs before the router starts, to
+// set the backend's state the router finds at startup.
+func newEnvWith(t *testing.T, extra string, setup func(*env)) *env {
 	t.Helper()
 	e := &env{dir: t.TempDir()}
 	e.selection = filepath.Join(e.dir, "selection")
 	e.serving = filepath.Join(e.dir, "serving")
 	e.hold = filepath.Join(e.dir, "held")
+	e.active = filepath.Join(e.dir, "active")
+	e.engineDown = filepath.Join(e.dir, "engine-down")
 	if err := os.WriteFile(e.serving, []byte("large\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	// The driver runs `systemctl --no-ask-password <verb> <unit>`, so the
+	// verb is $2.
 	systemctl := filepath.Join(e.dir, "systemctl")
 	script := fmt.Sprintf(`#!/bin/sh
 case "$2" in
-  restart) sleep 0.05; cp '%[1]s' '%[2]s' ;;
+  restart) sleep 0.05; cp '%[1]s' '%[2]s'; rm -f '%[4]s' ;;
   stop) rm -f '%[2]s' ;;
+  is-active) if [ -e '%[3]s' ]; then echo active; else echo unknown; fi ;;
 esac
-`, e.selection, e.serving)
+`, e.selection, e.serving, e.active, e.engineDown)
 	if err := os.WriteFile(systemctl, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +81,10 @@ esac
 		}
 		variant := strings.TrimSpace(string(data))
 		if r.URL.Path == "/v1/models" {
+			if _, err := os.Stat(e.engineDown); err == nil {
+				fmt.Fprint(w, `{"data":[]}`)
+				return
+			}
 			fmt.Fprintf(w, `{"data":[{"id":%q,"status":{"value":"loaded"}}]}`, variant)
 			return
 		}
@@ -98,7 +119,7 @@ esac
       "driver": {"kind": "systemd", "systemd": {
         "unit": "llm-backend.service", "selectionFile": %q, "defaultVariant": "large",
         "systemctl": %q, "actionTimeout": "10s"}},
-      "readiness": {"bodyContains": "loaded", "interval": "20ms", "timeout": "10s"},
+      "readiness": {"bodyContains": "loaded", "interval": "20ms", "timeout": "10s", "startupGrace": "300ms"},
       "hold": {"file": %q, "retryAfter": "30s"}
     }
   },
@@ -108,6 +129,9 @@ esac
     "m-small": {"backend": "llm", "variant": "small", "inject": {"projection": false}}
   }
 }`, extra, e.upstream.URL, e.selection, systemctl, e.hold)
+	if setup != nil {
+		setup(e)
+	}
 	cfg, err := config.Parse([]byte(cfgJSON))
 	if err != nil {
 		t.Fatalf("config: %v", err)
@@ -320,6 +344,42 @@ func TestEndToEndStreamCutByUpstreamDoesNotBlockSwitching(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	if resp.StatusCode != 200 || out["variant"] != "small" {
 		t.Fatalf("status %d, variant %v; want 200 from small", resp.StatusCode, out["variant"])
+	}
+}
+
+// The router starts (or restarts) while its backend's unit is up but its
+// engine has stopped and only reloads when a request reaches it. Waiting for
+// readiness alone would deadlock; after the startup grace the router must
+// restart the backend and serve the request.
+func TestEndToEndUpButNeverReadyBackendIsRestarted(t *testing.T) {
+	e := newEnvWith(t, "", func(e *env) {
+		for _, f := range []string{e.active, e.engineDown} {
+			if err := os.WriteFile(f, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	start := time.Now()
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(e.url+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"m-large"}`))
+	if err != nil {
+		t.Fatalf("request to a stuck backend: %v", err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if resp.StatusCode != 200 || out["variant"] != "large" {
+		t.Fatalf("status %d, variant %v; want 200 from large", resp.StatusCode, out["variant"])
+	}
+	if d := time.Since(start); d < 300*time.Millisecond {
+		t.Fatalf("answered after %s, before the startup grace: the backend was not waited for", d)
+	}
+	if _, err := os.Stat(e.engineDown); err == nil {
+		t.Fatal("backend was never restarted")
+	}
+	if sel, _ := os.ReadFile(e.selection); strings.TrimSpace(string(sel)) != "large" {
+		t.Fatalf("selection file %q, want large", sel)
 	}
 }
 

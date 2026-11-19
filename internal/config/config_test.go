@@ -67,6 +67,9 @@ func TestParseValidAppliesDefaults(t *testing.T) {
 	if b.Readiness.ExpectStatus != 200 || b.Readiness.Interval.D() != DefaultReadyInterval {
 		t.Errorf("readiness defaults = %+v", b.Readiness)
 	}
+	if b.Readiness.StartupGrace != b.Readiness.Timeout {
+		t.Errorf("startupGrace = %s, want the readiness timeout %s", b.Readiness.StartupGrace.D(), b.Readiness.Timeout.D())
+	}
 	if c.Limits.MaxBodyBytes != DefaultMaxBodyBytes {
 		t.Errorf("MaxBodyBytes = %d", c.Limits.MaxBodyBytes)
 	}
@@ -83,6 +86,17 @@ func TestParseAcceptsHold(t *testing.T) {
 	}
 	if h := c.Backends["llm"].Hold; h.File != "/run/console/held" || h.RetryAfter.D() != 90*time.Second {
 		t.Fatalf("hold = %+v", h)
+	}
+}
+
+func TestParseAcceptsStartupGrace(t *testing.T) {
+	s := strings.Replace(validJSON, `"timeout": "5m"`, `"timeout": "5m", "startupGrace": "90s"`, 1)
+	c, err := Parse([]byte(s))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if g := c.Backends["llm"].Readiness.StartupGrace.D(); g != 90*time.Second {
+		t.Fatalf("startupGrace = %s", g)
 	}
 }
 
@@ -111,6 +125,9 @@ func TestParseRejects(t *testing.T) {
 		}, "credentials"},
 		{"upstream not http", func(s string) string { return strings.Replace(s, "http://127.0.0.1:8001", "ftp://127.0.0.1", 1) }, "absolute http(s)"},
 		{"readiness exceeds maxWait", func(s string) string { return strings.Replace(s, `"timeout": "5m"`, `"timeout": "2h"`, 1) }, "exceeds groups.gpu0.maxWait"},
+		{"startupGrace exceeds readiness timeout", func(s string) string {
+			return strings.Replace(s, `"timeout": "5m"`, `"timeout": "5m", "startupGrace": "6m"`, 1)
+		}, "readiness.startupGrace"},
 		{"action exceeds maxWait", func(s string) string { return strings.Replace(s, `"actionTimeout": "2m"`, `"actionTimeout": "3h"`, 1) }, "actionTimeout"},
 		{"negative duration", func(s string) string { return strings.Replace(s, `"actionTimeout": "2m"`, `"actionTimeout": "-1m"`, 1) }, "negative"},
 		{"bad unknown policy", func(s string) string {
