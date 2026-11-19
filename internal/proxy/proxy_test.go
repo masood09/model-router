@@ -55,6 +55,11 @@ func newUpstream(t testing.TB) *upstream {
 			for i := range 3 {
 				fmt.Fprintf(w, "data: {\"n\":%d}\n\n", i)
 				fl.Flush()
+				if body["abort"] == true {
+					// The engine dies mid-stream: the connection drops after
+					// the status line and the first event have gone out.
+					panic(http.ErrAbortHandler)
+				}
 				time.Sleep(60 * time.Millisecond)
 			}
 			fmt.Fprint(w, "data: [DONE]\n\n")
@@ -516,6 +521,31 @@ func TestUpstreamDownGives502AndMarksUnready(t *testing.T) {
 	}
 	if h.group.State().Ready {
 		t.Fatal("group still marked ready after an upstream failure")
+	}
+}
+
+// An upstream that fails after the response has started makes ReverseProxy
+// abort the handler with a panic. The request's in-flight slot must still be
+// released, or the group never switches or restarts the backend again.
+func TestUpstreamDyingMidStreamReleasesInFlight(t *testing.T) {
+	h := newHarness(t, "")
+	resp := h.post(t, "/v1/chat/completions", `{"model":"big","stream":true,"abort":true}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if _, err := io.ReadAll(resp.Body); err == nil {
+		t.Fatal("stream ended cleanly; want it cut off")
+	}
+	// Released as the handler unwinds, which can trail the client, so poll.
+	deadline := time.Now().Add(2 * time.Second)
+	for h.group.State().InFlight != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("in-flight slot leaked: state = %+v", h.group.State())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if resp := h.post(t, "/v1/chat/completions", `{"model":"small"}`); resp.StatusCode != 200 {
+		t.Fatalf("switch after the aborted stream: status %d", resp.StatusCode)
 	}
 }
 

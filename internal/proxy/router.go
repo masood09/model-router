@@ -288,14 +288,24 @@ func (r *Router) serveModel(w *recorder, req *http.Request) (label, target strin
 		a := &attempt{retryable: rt.group != nil && try == 0}
 		attemptReq := req.WithContext(context.WithValue(base, attemptKey{}, a))
 		attemptReq.Body = io.NopCloser(bytes.NewReader(out))
-		r.proxies[rt.key.Backend].ServeHTTP(w, attemptReq)
-		if release != nil {
-			release()
-		}
+		r.forward(rt.key.Backend, w, attemptReq, release)
 		if !a.dialFailed {
 			return label, target, queued
 		}
 	}
+}
+
+// forward proxies one attempt to backend and then runs release (if not nil).
+// release is deferred because ReverseProxy aborts the handler with
+// panic(http.ErrAbortHandler) when the upstream fails after the response has
+// started (an engine dying mid-stream). Skipping it there would leave the
+// request counted as in flight for good, and the group then never switches
+// or restarts the backend again.
+func (r *Router) forward(backend string, w http.ResponseWriter, req *http.Request, release func()) {
+	if release != nil {
+		defer release()
+	}
+	r.proxies[backend].ServeHTTP(w, req)
 }
 
 // attempt records, per proxied attempt, whether it may be retried and

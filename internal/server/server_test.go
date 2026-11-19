@@ -74,6 +74,9 @@ esac
 			for i := range 5 {
 				fmt.Fprintf(w, "data: {\"variant\":%q,\"n\":%d}\n\n", variant, i)
 				w.(http.Flusher).Flush()
+				if body["abort"] == true {
+					panic(http.ErrAbortHandler) // the engine dies mid-stream
+				}
 				time.Sleep(100 * time.Millisecond)
 			}
 			fmt.Fprint(w, "data: [DONE]\n\n")
@@ -286,6 +289,37 @@ func TestGracefulShutdownDrainsStreams(t *testing.T) {
 	}
 	if _, err := http.Get(e.url + "/_router/healthz"); err == nil {
 		t.Fatal("server still accepting connections after shutdown")
+	}
+}
+
+// A backend that dies mid-stream must not leave the group thinking a request
+// is still in flight: that blocks every later switch or restart, and each
+// request waits out maxWait and fails with 503.
+func TestEndToEndStreamCutByUpstreamDoesNotBlockSwitching(t *testing.T) {
+	e := newEnv(t, "")
+	resp, err := http.Post(e.url+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"m-large","stream":true,"abort":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(resp.Body); err == nil {
+		t.Fatal("stream ended cleanly; want it cut off")
+	}
+	resp.Body.Close()
+
+	// Well under the group's 20s maxWait, so a leaked slot fails here rather
+	// than as a slow 503.
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err = client.Post(e.url+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"m-small"}`))
+	if err != nil {
+		t.Fatalf("switch after the cut stream: %v", err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if resp.StatusCode != 200 || out["variant"] != "small" {
+		t.Fatalf("status %d, variant %v; want 200 from small", resp.StatusCode, out["variant"])
 	}
 }
 
