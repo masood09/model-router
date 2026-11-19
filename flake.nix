@@ -13,7 +13,7 @@
   }: let
     systems = ["x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"];
     forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-    version = "0.1.0-${self.shortRev or self.dirtyShortRev or "dev"}";
+    version = "0.2.0-${self.shortRev or self.dirtyShortRev or "dev"}";
     src = nixpkgs.lib.fileset.toSource {
       root = ./.;
       fileset = nixpkgs.lib.fileset.unions [./go.mod ./cmd ./internal];
